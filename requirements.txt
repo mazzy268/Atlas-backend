@@ -16,3 +16,4 @@ structlog==24.2.0
 
 geopy==2.4.1
 groq
+requests
