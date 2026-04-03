@@ -17,10 +17,19 @@ import re
 from datetime import datetime
 
 # ── Core app imports ──────────────────────────────────────────────────────────
-from app.core.config import get_settings
-from app.core.logging import configure_logging, get_logger
-from app.services.geocoder import geocode_address
-from app.services.ai_analysis.report_builder import gather_all_data, run_all_ai_features
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# ✅ MUST be AFTER app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # allow Lovable + browser
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── Advanced service imports ──────────────────────────────────────────────────
 from app.services.advanced import (
