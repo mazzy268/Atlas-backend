@@ -35,9 +35,15 @@ app = FastAPI(
 )
 
 # ── CORS ───────────────────────────────────────────────────────────────────────
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# ✅ MUST be AFTER app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if settings.app_env == "development" else ["https://yourapp.com"],
+    allow_origins=["*"],  # allow Lovable + browser
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
