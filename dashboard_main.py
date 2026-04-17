@@ -126,13 +126,21 @@ class PortfolioAddRequest(BaseModel):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/analyse-property")
-async def analyse_property(data: PropertyRequest):
+async def analyse_property(request: Request):
     """
-    Master endpoint. Accepts a UK postcode, returns full property
+    Master endpoint. Accepts a UK postcode or address, returns full property
     intelligence JSON for Lovable dashboard widgets.
     No database — all computed from live API data.
     """
-    input_location = (data.address or data.postcode or "").strip()
+    try:
+        body = await request.json()
+    except Exception:
+        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
+        body = {"address": raw} if raw else {}
+
+    input_location = (
+        body.get("address") or body.get("postcode") or ""
+    ).strip()
     if not input_location:
         raise HTTPException(status_code=422, detail="Provide 'address' or 'postcode'")
 
