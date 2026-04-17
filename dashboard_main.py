@@ -99,6 +99,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    import traceback
+    log.error("unhandled_exception", path=str(request.url), error=str(exc), tb=traceback.format_exc())
+    return JSONResponse(status_code=500, content={"detail": str(exc), "type": type(exc).__name__})
+
 
 # ── Request models ────────────────────────────────────────────────────────────
 
@@ -159,6 +168,9 @@ async def analyse_property(data: PropertyRequest):
     flood_d   = _sr(fetched[4], {})
     trans_d   = _sr(fetched[5], {})
     epc       = epc_list[0] if epc_list else {}
+
+    # Use postcodes.io region (proper name like "North East") over Nominatim's "England"
+    region = demo_d.get("region", region).lower() if demo_d.get("region") else region
 
     # Step 3: Derive all values
     beds        = _infer_bedrooms(epc)
