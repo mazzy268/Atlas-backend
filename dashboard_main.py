@@ -84,6 +84,10 @@ ONS_GROWTH = {
 }
 
 # ── App init ──────────────────────────────────────────────────────────────────
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
 app = FastAPI(
     title="Atlas Property Intelligence",
     description="UK property analysis API — no database required",
@@ -91,6 +95,24 @@ app = FastAPI(
     docs_url="/docs",
 )
 
+class _FixJSONMiddleware(BaseHTTPMiddleware):
+    """Fix malformed JSON bodies (unquoted keys from Lovable) before Pydantic sees them."""
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "POST":
+            body = await request.body()
+            if body:
+                try:
+                    json.loads(body)
+                except (json.JSONDecodeError, ValueError):
+                    text = body.decode("utf-8", errors="ignore").strip()
+                    if text.startswith("{"):
+                        text = re.sub(r'(?<=[{,])\s*([A-Za-z_]\w*)\s*:', r'"\1":', text)
+                    else:
+                        text = json.dumps({"address": text})
+                    request._body = text.encode("utf-8")
+        return await call_next(request)
+
+app.add_middleware(_FixJSONMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -98,9 +120,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-from fastapi import Request
-from fastapi.responses import JSONResponse
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -125,37 +144,17 @@ class PortfolioAddRequest(BaseModel):
 # MASTER ENDPOINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/analyse-property", openapi_extra={
-    "requestBody": {
-        "required": True,
-        "content": {"application/json": {"schema": {
-            "type": "object",
-            "properties": {
-                "address":  {"type": "string", "example": "10 Downing Street, London, SW1A 2AA"},
-                "postcode": {"type": "string", "example": "SW1A 2AA"},
-            },
-        }}},
-    }
-})
-async def analyse_property(request: Request):
+@app.post("/analyse-property")
+async def analyse_property(data: PropertyRequest):
     """
     Master endpoint. Accepts a UK postcode or address, returns full property
     intelligence JSON for Lovable dashboard widgets.
     No database — all computed from live API data.
     """
-    try:
-        body = await request.json()
-    except Exception:
-        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-        body = {"address": raw} if raw else {}
-
-    input_location = (
-        body.get("address") or body.get("postcode") or ""
-    ).strip()
+    input_location = (data.address or data.postcode or "").strip()
     if not input_location:
         raise HTTPException(status_code=422, detail="Provide 'address' or 'postcode'")
 
-    # Step 1: Geocode using whatever the user provided
     try:
         coords = await _geocode(input_location)
     except Exception as e:
