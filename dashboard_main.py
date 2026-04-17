@@ -125,7 +125,18 @@ class PortfolioAddRequest(BaseModel):
 # MASTER ENDPOINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/analyse-property")
+@app.post("/analyse-property", openapi_extra={
+    "requestBody": {
+        "required": True,
+        "content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+                "address":  {"type": "string", "example": "10 Downing Street, London, SW1A 2AA"},
+                "postcode": {"type": "string", "example": "SW1A 2AA"},
+            },
+        }}},
+    }
+})
 async def analyse_property(request: Request):
     """
     Master endpoint. Accepts a UK postcode or address, returns full property
