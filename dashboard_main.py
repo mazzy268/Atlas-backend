@@ -87,49 +87,6 @@ ONS_GROWTH = {
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-class _FixJSONBody:
-    """
-    Pure ASGI middleware that patches the receive channel so FastAPI's
-    Pydantic parser sees valid JSON even when the client sends unquoted keys
-    (JS object literal notation) or a bare postcode string.
-    """
-    def __init__(self, app):
-        self._app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("method") == "POST":
-            chunks, more = [], True
-            while more:
-                msg = await receive()
-                chunks.append(msg.get("body", b""))
-                more = msg.get("more_body", False)
-            body = b"".join(chunks)
-
-            if body:
-                try:
-                    json.loads(body)
-                except (json.JSONDecodeError, ValueError):
-                    text = body.decode("utf-8", errors="ignore").strip()
-                    if text.startswith("{"):
-                        # {address: "x"} → {"address": "x"}
-                        text = re.sub(r'(?<=[{,])\s*([A-Za-z_]\w*)\s*:', r'"\1":', text)
-                    else:
-                        text = json.dumps({"address": text})
-                    body = text.encode("utf-8")
-
-            sent = False
-            async def patched_receive():
-                nonlocal sent
-                if not sent:
-                    sent = True
-                    return {"type": "http.request", "body": body, "more_body": False}
-                return {"type": "http.disconnect"}
-
-            await self._app(scope, patched_receive, send)
-        else:
-            await self._app(scope, receive, send)
-
-
 app = FastAPI(
     title="Atlas Property Intelligence",
     description="UK property analysis API — no database required",
@@ -151,8 +108,6 @@ async def global_exception_handler(request: Request, exc: Exception):
     log.error("unhandled_exception", path=str(request.url), error=str(exc), tb=traceback.format_exc())
     return JSONResponse(status_code=500, content={"detail": str(exc), "type": type(exc).__name__})
 
-app = _FixJSONBody(app)
-
 
 # ── Request models ────────────────────────────────────────────────────────────
 
@@ -170,14 +125,33 @@ class PortfolioAddRequest(BaseModel):
 # MASTER ENDPOINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@app.post("/analyse-property")
-async def analyse_property(data: PropertyRequest):
-    """
-    Master endpoint. Accepts a UK postcode or address, returns full property
-    intelligence JSON for Lovable dashboard widgets.
-    No database — all computed from live API data.
-    """
-    input_location = (data.address or data.postcode or "").strip()
+@app.post(
+    "/analyse-property",
+    openapi_extra={"requestBody": {"required": True, "content": {"application/json": {"schema": {
+        "type": "object",
+        "properties": {
+            "address":  {"type": "string", "example": "SW1A 2AA"},
+            "postcode": {"type": "string", "example": "SW1A 2AA"},
+        }
+    }}}}}
+)
+async def analyse_property(request: Request):
+    """Full UK property intelligence. Send either address or postcode."""
+    try:
+        body = await request.json()
+    except Exception:
+        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
+        if raw.startswith("{"):
+            # fix unquoted keys: {address: "x"} → {"address": "x"}
+            fixed = re.sub(r'(?<=[{,])\s*([A-Za-z_]\w*)\s*:', r'"\1":', raw)
+            try:
+                body = json.loads(fixed)
+            except Exception:
+                body = {}
+        else:
+            body = {"address": raw} if raw else {}
+
+    input_location = (body.get("address") or body.get("postcode") or "").strip()
     if not input_location:
         raise HTTPException(status_code=422, detail="Provide 'address' or 'postcode'")
 
