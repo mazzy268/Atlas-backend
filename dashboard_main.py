@@ -137,28 +137,34 @@ class PortfolioAddRequest(BaseModel):
 )
 async def analyse_property(request: Request):
     """Full UK property intelligence. Send either address or postcode."""
+    import traceback as _tb
     try:
-        body = await request.json()
-    except Exception:
-        raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-        if raw.startswith("{"):
-            # fix unquoted keys: {address: "x"} → {"address": "x"}
-            fixed = re.sub(r'(?<=[{,])\s*([A-Za-z_]\w*)\s*:', r'"\1":', raw)
+        raw_text = (await request.body()).decode("utf-8", errors="ignore").strip()
+        body = {}
+        if raw_text:
             try:
-                body = json.loads(fixed)
-            except Exception:
-                body = {}
-        else:
-            body = {"address": raw} if raw else {}
+                parsed = json.loads(raw_text)
+                body = parsed if isinstance(parsed, dict) else {"address": str(parsed)}
+            except (json.JSONDecodeError, ValueError):
+                if raw_text.startswith("{"):
+                    fixed = re.sub(r'(?<=[{,])\s*([A-Za-z_]\w*)\s*:', r'"\1":', raw_text)
+                    try:
+                        body = json.loads(fixed)
+                    except Exception:
+                        body = {"address": raw_text}
+                else:
+                    body = {"address": raw_text}
 
-    input_location = (body.get("address") or body.get("postcode") or "").strip()
-    if not input_location:
-        raise HTTPException(status_code=422, detail="Provide 'address' or 'postcode'")
+        input_location = (body.get("address") or body.get("postcode") or "").strip()
+        if not input_location:
+            raise HTTPException(status_code=422, detail="Provide 'address' or 'postcode'")
 
-    try:
         coords = await _geocode(input_location)
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Could not resolve location: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e), "trace": _tb.format_exc()})
 
     lat    = coords["latitude"]
     lng    = coords["longitude"]
@@ -259,7 +265,7 @@ async def analyse_property(request: Request):
 
     return {
         "postcode": rpc,
-        "display_address": coords.get("display_name", postcode),
+        "display_address": coords.get("display_name", input_location),
         "latitude": lat,
         "longitude": lng,
         "generated_at": datetime.utcnow().isoformat(),
@@ -328,7 +334,7 @@ async def analyse_property(request: Request):
             "key_risks": ai.get("key_risks") or _default_risks(risk_sc, flood_lv, crime_tot),
             "void_period_weeks": 4 if rd_sc >= 60 else 8,
             "tenant_profiles": _tenant_profiles(region, strategy),
-            "summary": ai.get("summary") or _default_summary(postcode, inv_sc, strategy, est_value, g_yield, val_5yr),
+            "summary": ai.get("summary") or _default_summary(rpc, inv_sc, strategy, est_value, g_yield, val_5yr),
         },
 
         "renovation": {
