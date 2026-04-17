@@ -83,6 +83,21 @@ ONS_GROWTH = {
     "northern ireland": 6.2, "default": 3.8,
 }
 
+# ── Typical gross yields by region (used as rent fallback) ───────────────────
+REGIONAL_YIELDS = {
+    "london": 3.5, "south east": 4.0, "east of england": 4.2,
+    "south west": 4.5, "east midlands": 5.5, "west midlands": 5.2,
+    "north west": 5.8, "yorkshire and the humber": 5.5,
+    "north east": 6.5, "wales": 5.0, "scotland": 5.5,
+    "default": 5.0,
+}
+
+# ── Property type rent multipliers ───────────────────────────────────────────
+PROP_TYPE_MULTIPLIER = {
+    "detached": 1.12, "semi-detached": 1.02, "terraced": 0.97,
+    "flat": 0.93, "maisonette": 0.93, "bungalow": 0.90,
+}
+
 # ── App init ──────────────────────────────────────────────────────────────────
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -203,7 +218,12 @@ async def analyse_property(request: Request):
     epc_rating  = epc.get("current-energy-rating") or epc.get("current_energy_rating")
 
     est_value   = _calc_value(sales, region, floor_area, beds)
-    rent        = _voa_rent(region, beds)
+    rent        = _voa_rent(region, beds, prop_type, trans_sc, crime_sc)
+    # Fallback: if no value from sales, derive rent from value×yield
+    if not sales and est_value:
+        rent = max(rent, _rent_from_value(est_value, region))
+    # Validate and auto-correct unrealistic financials
+    est_value, rent, _val_warnings = _validate_financials(est_value, rent, region, sales)
     g_yield     = round(rent * 12 / est_value * 100, 2) if est_value else 0.0
     deposit     = int(est_value * 0.25)
     loan        = est_value - deposit
@@ -373,7 +393,9 @@ async def analyse_property(request: Request):
 
         "neighbourhood": {
             "overall_desirability": _desirability(inv_sc, crime_sc, trans_sc),
+            "desirability_score": _area_desirability_score(crime_sc, trans_sc, demo_d),
             "area_trajectory": _trajectory(region, growth_r),
+            "growth_classification": _growth_classification(region, growth_r, crime_tot, demo_d.get("imd_decile")),
             "income_estimate": _income_est(region),
             "investor_appeal": "High" if inv_sc >= 65 else "Medium" if inv_sc >= 45 else "Low",
             "transport_score": trans_sc,
@@ -427,10 +449,12 @@ async def analyse_property(request: Request):
             "hmo_cashflow": max(0, hmo_rent - mortgage - 200),
         },
 
-        "confidence": {
-            "valuation": 75 if len(sales) >= 5 else 55 if len(sales) >= 2 else 35,
-            "rent": 80,
-            "overall": 70 if len(sales) >= 3 else 50,
+        "confidence": _confidence_score(sales, epc, demo_d, crime_tot),
+
+        "data_validation": {
+            "warnings": _val_warnings,
+            "yield_realistic": 1.5 <= g_yield <= 15,
+            "value_realistic": 40_000 <= est_value <= 5_000_000,
         },
 
         "data_freshness": {
@@ -943,12 +967,52 @@ def _calc_value(sales: list, region: str, floor_area: float, beds: int = 3) -> i
     return int((weighted[mid - 1] + weighted[mid]) / 2) if len(weighted) % 2 == 0 else weighted[mid]
 
 
-def _voa_rent(region: str, bedrooms: int) -> int:
+def _voa_rent(region: str, bedrooms: int, prop_type: str = "", transport_sc: int = 5, crime_sc: int = 5) -> int:
     beds = max(1, min(bedrooms, 4))
+    base = VOA_RENTS["default"][beds]
     for key in VOA_RENTS:
         if key != "default" and key in region:
-            return VOA_RENTS[key][beds]
-    return VOA_RENTS["default"][beds]
+            base = VOA_RENTS[key][beds]
+            break
+    # Property type multiplier
+    pt = prop_type.lower()
+    mult = next((v for k, v in PROP_TYPE_MULTIPLIER.items() if k in pt), 1.0)
+    # Tenant demand: better transport and lower crime push rents up slightly
+    demand = 1.0 + (transport_sc - 5) * 0.012 + (crime_sc - 5) * 0.01
+    demand = max(0.85, min(1.20, demand))
+    return int(base * mult * demand)
+
+
+def _rent_from_value(est_value: int, region: str) -> int:
+    """Fallback rent derived from value × regional yield."""
+    y = REGIONAL_YIELDS.get("default", 5.0)
+    for key in REGIONAL_YIELDS:
+        if key != "default" and key in region:
+            y = REGIONAL_YIELDS[key]
+            break
+    return int(est_value * y / 100 / 12)
+
+
+def _validate_financials(est_value: int, rent: int, region: str, sales: list):
+    """Detect and auto-correct unrealistic values. Returns (value, rent, warnings)."""
+    warnings = []
+    # Value bounds for UK residential property
+    if est_value < 40_000:
+        fallback = _voa_rent(region, 3) * 12 * 18
+        warnings.append(f"Estimated value £{est_value:,} below UK minimum — adjusted to £{fallback:,}")
+        est_value = fallback
+    elif est_value > 5_000_000:
+        warnings.append(f"Estimated value £{est_value:,} capped at £5,000,000")
+        est_value = 5_000_000
+    # Yield sanity — UK gross yields rarely exceed 15%
+    if est_value > 0:
+        gross_yield = rent * 12 / est_value * 100
+        if gross_yield > 15:
+            rent = _rent_from_value(est_value, region)
+            warnings.append(f"Yield {gross_yield:.1f}% unrealistic — rent recalculated from value")
+        elif gross_yield < 1.0 and rent > 0:
+            warnings.append(f"Yield {gross_yield:.1f}% very low — verify value data")
+    return est_value, rent, warnings
 
 
 def _get_growth(region: str) -> float:
@@ -1166,11 +1230,30 @@ def _desirability(inv, crime, transport):
     if score >= 25: return "Below average"
     return "Regeneration area"
 
+
+def _area_desirability_score(crime_sc: int, trans_sc: int, demo_d: dict) -> int:
+    imd = _i(demo_d.get("imd_decile"), 5)
+    score = crime_sc * 7 + trans_sc * 3 + imd * 2
+    return max(0, min(100, score))
+
+
+def _growth_classification(region: str, growth_r: float, crime_tot: int, imd_decile) -> str:
+    imd = imd_decile or 5
+    if growth_r >= 5.0 and crime_tot < 120:
+        return "strong_growth"
+    if imd <= 2 or crime_tot > 250:
+        return "declining"
+    if growth_r < 3.0 and any(r in region for r in ["north east", "wales", "yorkshire", "west midlands"]):
+        return "regeneration"
+    if growth_r >= 3.5:
+        return "stable"
+    return "stable"
+
+
 def _trajectory(region, growth):
-    if growth >= 5.0: return "Strong growth"
-    if growth >= 3.5: return "Stable"
-    if any(r in region for r in ["north east", "wales"]): return "Regeneration zone"
-    return "Stable"
+    cls = _growth_classification(region, growth, 0, 5)
+    return {"strong_growth": "Strong growth", "stable": "Stable",
+            "regeneration": "Regeneration zone", "declining": "Declining"}.get(cls, "Stable")
 
 def _income_est(region):
     if any(r in region for r in ["london", "south east", "east of england"]): return "Above average — median ~£48k"
@@ -1197,13 +1280,35 @@ def _suitable_for(risk_score):
     if risk_score < 65: return "Experienced investors only"
     return "High risk — specialist investors only"
 
+def _confidence_score(sales: list, epc: dict, demo_d: dict, crime_tot: int) -> dict:
+    n = len(sales)
+    if n >= 8:   val_label, val_sc = "high",   85
+    elif n >= 3: val_label, val_sc = "medium",  65
+    elif n >= 1: val_label, val_sc = "low",     40
+    else:        val_label, val_sc = "low",     20
+    if bool(epc) and bool(demo_d):
+        rent_label, rent_sc = "high",   80
+    elif bool(demo_d):
+        rent_label, rent_sc = "medium", 60
+    else:
+        rent_label, rent_sc = "low",    40
+    return {
+        "valuation": val_label,
+        "valuation_score": val_sc,
+        "rent": rent_label,
+        "rent_score": rent_sc,
+        "overall": int((val_sc + rent_sc) / 2),
+        "data_points": n,
+    }
+
+
 def _default_positives(inv_sc, g_yield, transport):
     p = []
     if g_yield >= 6: p.append(f"Strong gross yield of {g_yield:.1f}%")
     if transport >= 6: p.append("Good transport connectivity")
     if inv_sc >= 60: p.append("Above average investment score")
-    p.append("Freehold — no ground rent or service charge")
-    return p[:3]
+    if g_yield >= 4: p.append(f"Yield of {g_yield:.1f}% above savings rate")
+    return p[:3] or ["Requires further due diligence"]
 
 def _default_risks(risk_sc, flood, crime_total):
     r = []
