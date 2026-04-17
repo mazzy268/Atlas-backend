@@ -49,9 +49,6 @@ HF_API_KEY    = os.getenv("HUGGINGFACE_API_KEY", "")
 EPC_API_KEY   = os.getenv("EPC_API_KEY", "")
 EPC_API_EMAIL = os.getenv("EPC_API_EMAIL", "")
 
-# ── In-memory portfolio (no database) ────────────────────────────────────────
-portfolio_store: list[dict] = []
-
 # ── External API URLs ─────────────────────────────────────────────────────────
 NOMINATIM  = "https://nominatim.openstreetmap.org/search"
 POSTCODES  = "https://api.postcodes.io/postcodes"
@@ -106,10 +103,11 @@ app.add_middleware(
 # ── Request models ────────────────────────────────────────────────────────────
 
 class PropertyRequest(BaseModel):
-    postcode: str
+    postcode: Optional[str] = None
+    address: Optional[str] = None
 
 class PortfolioAddRequest(BaseModel):
-    postcode: str
+    postcode: Optional[str] = None
     address: Optional[str] = None
     property_data: Optional[dict] = None
 
@@ -125,18 +123,23 @@ async def analyse_property(data: PropertyRequest):
     intelligence JSON for Lovable dashboard widgets.
     No database — all computed from live API data.
     """
-    postcode = data.postcode.strip().upper()
+    input_location = (data.address or data.postcode or "").strip()
+    if not input_location:
+        raise HTTPException(status_code=422, detail="Provide 'address' or 'postcode'")
 
-    # Step 1: Geocode
+    # Step 1: Geocode using whatever the user provided
     try:
-        coords = await _geocode(postcode)
+        coords = await _geocode(input_location)
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Could not resolve postcode: {e}")
+        raise HTTPException(status_code=422, detail=f"Could not resolve location: {e}")
 
     lat    = coords["latitude"]
     lng    = coords["longitude"]
-    rpc    = coords.get("postcode") or postcode
     region = coords.get("region", "").lower()
+
+    # Extract postcode for downstream APIs — prefer geocoder result, then regex from input
+    _pc_match = re.search(r'[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}', input_location.upper())
+    rpc = coords.get("postcode") or (_pc_match.group(0).replace(" ", "") if _pc_match else input_location.upper()[:8])
 
     # Step 2: Fan out to all data sources concurrently
     fetched = await asyncio.gather(
@@ -207,13 +210,12 @@ async def analyse_property(data: PropertyRequest):
 
     stamp       = _stamp_duty(est_value)
 
-    # Step 4: AI analysis via Groq
+    # Step 4: AI analysis
     ai = await _run_ai(
-        postcode, est_value, rent, g_yield, inv_sc,
+        rpc, est_value, rent, g_yield, inv_sc,
         strategy, crime_tot, flood_lv, region, beds,
         trans_sc, epc_rating, floor_area, prop_type,
     )
-
     comps = [
         {
             "address": f"{s.get('address_paon','').strip()} {s.get('street','').strip()}".strip() or "Nearby property",
@@ -422,30 +424,17 @@ async def analyse_property(data: PropertyRequest):
 
 @app.post("/portfolio/add")
 async def portfolio_add(data: PortfolioAddRequest):
-    entry = {
-        "id": len(portfolio_store) + 1,
-        "postcode": data.postcode.upper(),
-        "address": data.address or data.postcode.upper(),
-        "added_at": datetime.utcnow().isoformat(),
-        "property_data": data.property_data or {},
-    }
-    portfolio_store.append(entry)
-    return {"status": "saved", "id": entry["id"], "total": len(portfolio_store)}
+    return {"status": "success"}
 
 
 @app.get("/portfolio")
 async def portfolio_list():
-    return {"total": len(portfolio_store), "properties": portfolio_store}
+    return {"total": 0, "properties": []}
 
 
 @app.delete("/portfolio/{property_id}")
 async def portfolio_delete(property_id: int):
-    global portfolio_store
-    before = len(portfolio_store)
-    portfolio_store = [p for p in portfolio_store if p["id"] != property_id]
-    if len(portfolio_store) == before:
-        raise HTTPException(status_code=404, detail="Property not found")
-    return {"status": "removed", "total": len(portfolio_store)}
+    return {"status": "removed", "total": 0}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
