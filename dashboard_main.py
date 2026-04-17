@@ -223,7 +223,7 @@ async def analyse_property(request: Request):
     trans_sc    = trans_d.get("transport_score", 0)
     flood_lv    = flood_d.get("risk_level", "Unknown")
 
-    est_value   = _calc_value(sales, region, floor_area, beds)
+    est_value   = _calc_value(sales, region, floor_area, beds, prop_type)
     rent        = _voa_rent(region, beds, prop_type, trans_sc, crime_sc)
     if not sales and est_value:
         rent = max(rent, _rent_from_value(est_value, region))
@@ -580,7 +580,8 @@ async def get_true_value(address: str, postcode: str):
         region = geo.get("region", "").lower()
         floor_area = _f(epc.get("total-floor-area"), 0.0)
         beds = _infer_bedrooms(epc)
-        value = _calc_value(sales, region, floor_area, beds)
+        prop_type = (epc.get("property-type") or "").lower()
+        value = _calc_value(sales, region, floor_area, beds, prop_type)
         return {
             "address": address,
             "postcode": postcode.upper(),
@@ -629,7 +630,7 @@ async def get_development(address: str, postcode: str):
         floor_area = _f(epc.get("total-floor-area"), 0.0)
         beds = _infer_bedrooms(epc)
         prop_type = (epc.get("property-type") or "house").lower()
-        value = _calc_value(sales, region, floor_area, beds)
+        value = _calc_value(sales, region, floor_area, beds, prop_type)
         loft = _loft_viable(prop_type, epc)
         ext = _extension_viable(prop_type, epc)
         cost = (35000 if loft else 0) + (45000 if ext else 0)
@@ -708,8 +709,19 @@ async def _fetch_demographics(postcode: str) -> dict:
 
 
 async def _fetch_sales(postcode: str, limit: int = 20) -> list:
-    pc = postcode.strip().upper()
-    query = f"""
+    pc_raw = postcode.strip().upper().replace(" ", "")
+    # Normalise to spaced format: "NE156DL" → "NE15 6DL" (HMLR stores with space)
+    pc_spaced = (pc_raw[:-3] + " " + pc_raw[-3:]) if len(pc_raw) >= 5 else postcode.strip().upper()
+    # Derive sector: "NE15 6DL" → "NE15 6"
+    m_sec = re.match(r'^([A-Z]{1,2}\d{1,2}[A-Z]?) ?(\d)', pc_spaced)
+    sector = f"{m_sec.group(1)} {m_sec.group(2)}" if m_sec else None
+
+    def _build_query(pc_filter: str, is_sector: bool, n: int) -> str:
+        if is_sector:
+            pc_clause = f'?addr lrcommon:postcode ?_pc . FILTER(STRSTARTS(?_pc, "{pc_filter}"))'
+        else:
+            pc_clause = f'?addr lrcommon:postcode "{pc_filter}" .'
+        return f"""
 PREFIX lrppi: <http://landregistry.data.gov.uk/def/ppi/>
 PREFIX lrcommon: <http://landregistry.data.gov.uk/def/common/>
 SELECT ?amount ?date ?propertyType ?estateType ?paon ?street WHERE {{
@@ -718,35 +730,51 @@ SELECT ?amount ?date ?propertyType ?estateType ?paon ?street WHERE {{
          lrppi:propertyType ?propertyType ;
          lrppi:estateType ?estateType ;
          lrppi:propertyAddress ?addr .
-  ?addr lrcommon:postcode "{pc}" .
+  {pc_clause}
   OPTIONAL {{ ?addr lrcommon:paon ?paon }}
   OPTIONAL {{ ?addr lrcommon:street ?street }}
 }}
 ORDER BY DESC(?date)
-LIMIT {limit}
+LIMIT {n}
 """
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                HMLR,
-                params={"query": query, "output": "json"},
-                headers={"Accept": "application/sparql-results+json"},
-            )
-            resp.raise_for_status()
-            bindings = resp.json().get("results", {}).get("bindings", [])
-            return [
-                {
-                    "price_gbp":      int(float(b["amount"]["value"])),
-                    "date":           b["date"]["value"],
-                    "property_type":  b.get("propertyType", {}).get("value", "").split("/")[-1],
-                    "tenure":         "Freehold" if "freehold" in b.get("estateType", {}).get("value", "").lower() else "Leasehold",
-                    "address_paon":   b.get("paon", {}).get("value", ""),
-                    "street":         b.get("street", {}).get("value", ""),
-                }
-                for b in bindings if "amount" in b
-            ]
-    except Exception:
-        return []
+
+    def _parse_bindings(bindings: list) -> list:
+        return [
+            {
+                "price_gbp":     int(float(b["amount"]["value"])),
+                "date":          b["date"]["value"],
+                "property_type": b.get("propertyType", {}).get("value", "").split("/")[-1],
+                "tenure":        "Freehold" if "freehold" in b.get("estateType", {}).get("value", "").lower() else "Leasehold",
+                "address_paon":  b.get("paon", {}).get("value", ""),
+                "street":        b.get("street", {}).get("value", ""),
+            }
+            for b in bindings if "amount" in b
+        ]
+
+    async def _run_sparql(query: str) -> list:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    HMLR,
+                    params={"query": query, "output": "json"},
+                    headers={"Accept": "application/sparql-results+json"},
+                )
+                resp.raise_for_status()
+                return _parse_bindings(resp.json().get("results", {}).get("bindings", []))
+        except Exception:
+            return []
+
+    # First: exact postcode (fast, precise)
+    exact = await _run_sparql(_build_query(pc_spaced, is_sector=False, n=10))
+    if len(exact) >= 5 or not sector:
+        return exact
+
+    # Widen to postcode sector for 10–50× more comparables
+    sector_results = await _run_sparql(_build_query(sector, is_sector=True, n=limit))
+    seen = {(s["price_gbp"], s["date"], s["address_paon"]) for s in exact}
+    merged = exact + [s for s in sector_results if (s["price_gbp"], s["date"], s["address_paon"]) not in seen]
+    merged.sort(key=lambda x: x.get("date", ""), reverse=True)
+    return merged[:limit]
 
 
 async def _fetch_epc(postcode: str) -> list:
@@ -943,10 +971,25 @@ async def _run_ai(postcode, value, rent, yield_pct, inv_score, strategy,
 # CALCULATION FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _calc_value(sales: list, region: str, floor_area: float, beds: int = 3) -> int:
+def _calc_value(sales: list, region: str, floor_area: float, beds: int = 3, prop_type: str = "") -> int:
+    # Regional price-per-sqm benchmarks (2024, £/sqm)
+    _PSM = {
+        "london": 7500, "south east": 4200, "east of england": 3400,
+        "south west": 3200, "east midlands": 2400, "west midlands": 2500,
+        "north west": 2300, "yorkshire and the humber": 2000,
+        "north east": 1800, "wales": 2000, "scotland": 2200, "default": 2600,
+    }
+
     if not sales:
-        return _voa_rent(region, beds) * 12 * 18
+        # Fallback: capitalise rent at ~5.5% yield
+        rent_anchor = _voa_rent(region, beds) * 12 * 18
+        if floor_area >= 30:
+            psm = next((v for k, v in _PSM.items() if k != "default" and k in region), _PSM["default"])
+            return max(int(floor_area * psm), rent_anchor)
+        return rent_anchor
+
     today = date.today()
+    pt_norm = prop_type.lower().split("/")[-1]  # handle URI fragments like ".../terraced"
     weighted = []
     for s in sales:
         price = s.get("price_gbp", 0)
@@ -957,13 +1000,28 @@ def _calc_value(sales: list, region: str, floor_area: float, beds: int = 3) -> i
             months_ago = (today.year - sd.year) * 12 + (today.month - sd.month)
         except Exception:
             months_ago = 24
+        # Recency weight
         w = 3 if months_ago <= 12 else 2 if months_ago <= 24 else 1
+        # Boost same property type by 50%
+        if pt_norm and pt_norm in s.get("property_type", "").lower():
+            w = max(w + 1, int(w * 1.5))
         weighted.extend([price] * w)
+
     if not weighted:
         return 0
+
     weighted.sort()
     mid = len(weighted) // 2
-    return int((weighted[mid - 1] + weighted[mid]) / 2) if len(weighted) % 2 == 0 else weighted[mid]
+    comp_value = int((weighted[mid - 1] + weighted[mid]) / 2) if len(weighted) % 2 == 0 else weighted[mid]
+
+    # Blend with price-per-sqm anchor when we have reliable floor area
+    if floor_area >= 30 and len(sales) >= 3:
+        psm = next((v for k, v in _PSM.items() if k != "default" and k in region), _PSM["default"])
+        sqm_anchor = int(floor_area * psm)
+        # 65% comparables (more reliable with enough data), 35% sqm anchor
+        comp_value = int(comp_value * 0.65 + sqm_anchor * 0.35)
+
+    return max(comp_value, 40_000)
 
 
 def _voa_rent(region: str, bedrooms: int, prop_type: str = "", transport_sc: int = 5, crime_sc: int = 5) -> int:
