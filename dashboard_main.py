@@ -217,12 +217,16 @@ async def analyse_property(request: Request):
     prop_type   = epc.get("property-type") or epc.get("property_type") or "Residential"
     epc_rating  = epc.get("current-energy-rating") or epc.get("current_energy_rating")
 
+    # Resolve crime/transport first — needed for rent calculation
+    crime_tot   = crime_d.get("total_crimes", 0)
+    crime_sc    = _crime_score(crime_tot)
+    trans_sc    = trans_d.get("transport_score", 0)
+    flood_lv    = flood_d.get("risk_level", "Unknown")
+
     est_value   = _calc_value(sales, region, floor_area, beds)
     rent        = _voa_rent(region, beds, prop_type, trans_sc, crime_sc)
-    # Fallback: if no value from sales, derive rent from value×yield
     if not sales and est_value:
         rent = max(rent, _rent_from_value(est_value, region))
-    # Validate and auto-correct unrealistic financials
     est_value, rent, _val_warnings = _validate_financials(est_value, rent, region, sales)
     g_yield     = round(rent * 12 / est_value * 100, 2) if est_value else 0.0
     deposit     = int(est_value * 0.25)
@@ -237,11 +241,6 @@ async def analyse_property(request: Request):
     val_1yr     = int(est_value * (1 + growth_r / 100))
     val_3yr     = int(est_value * ((1 + growth_r / 100) ** 3))
     val_5yr     = int(est_value * ((1 + growth_r / 100) ** 5))
-
-    crime_tot   = crime_d.get("total_crimes", 0)
-    crime_sc    = _crime_score(crime_tot)
-    trans_sc    = trans_d.get("transport_score", 0)
-    flood_lv    = flood_d.get("risk_level", "Unknown")
 
     inv_sc      = _investment_score(g_yield, crime_sc, trans_sc, flood_lv, sales)
     risk_sc     = _risk_score(flood_lv, crime_tot, demo_d)
