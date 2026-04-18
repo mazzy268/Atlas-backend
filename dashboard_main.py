@@ -223,7 +223,10 @@ async def analyse_property(request: Request):
     trans_sc    = trans_d.get("transport_score", 0)
     flood_lv    = flood_d.get("risk_level", "Unknown")
 
-    est_value   = _calc_value(sales, region, floor_area, beds, prop_type)
+    # UKHPI district anchor — official LR average price for this local authority
+    ukhpi_price = await _fetch_ukhpi_price(demo_d.get("admin_district", ""))
+
+    est_value   = _calc_value(sales, region, floor_area, beds, prop_type, ukhpi_price)
     rent        = _voa_rent(region, beds, prop_type, trans_sc, crime_sc)
     if not sales and est_value:
         rent = max(rent, _rent_from_value(est_value, region))
@@ -774,6 +777,16 @@ LIMIT {n}
     seen = {(s["price_gbp"], s["date"], s["address_paon"]) for s in exact}
     merged = exact + [s for s in sector_results if (s["price_gbp"], s["date"], s["address_paon"]) not in seen]
     merged.sort(key=lambda x: x.get("date", ""), reverse=True)
+    if len(merged) >= 5:
+        return merged[:limit]
+
+    # Last resort: widen to full postcode district (e.g. "NE15")
+    district = pc_spaced.split(" ")[0]  # "NE15 6DL" → "NE15"
+    if district and district != sector:
+        district_results = await _run_sparql(_build_query(district + " ", is_sector=True, n=limit))
+        seen2 = {(s["price_gbp"], s["date"], s["address_paon"]) for s in merged}
+        merged = merged + [s for s in district_results if (s["price_gbp"], s["date"], s["address_paon"]) not in seen2]
+        merged.sort(key=lambda x: x.get("date", ""), reverse=True)
     return merged[:limit]
 
 
@@ -862,6 +875,40 @@ out body;
     except Exception:
         pass
     return {"transport_score": 0, "nearest_stations": [], "bus_stop_count": 0}
+
+
+async def _fetch_ukhpi_price(admin_district: str) -> int:
+    """UKHPI SPARQL: most recent district-level average house price from Land Registry."""
+    if not admin_district:
+        return 0
+    label = admin_district.lower().strip()
+    query = f"""
+PREFIX ukhpi: <http://landregistry.data.gov.uk/def/ukhpi/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?averagePrice ?refPeriod WHERE {{
+  ?area rdfs:label ?lbl .
+  FILTER(LCASE(STR(?lbl)) = "{label}")
+  ?obs ukhpi:refArea ?area ;
+       ukhpi:averagePrice ?averagePrice ;
+       ukhpi:refPeriod ?refPeriod .
+}}
+ORDER BY DESC(?refPeriod)
+LIMIT 1
+"""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                HMLR,
+                params={"query": query, "output": "json"},
+                headers={"Accept": "application/sparql-results+json"},
+            )
+            resp.raise_for_status()
+            bindings = resp.json().get("results", {}).get("bindings", [])
+            if bindings and "averagePrice" in bindings[0]:
+                return int(float(bindings[0]["averagePrice"]["value"]))
+    except Exception:
+        pass
+    return 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -971,26 +1018,29 @@ async def _run_ai(postcode, value, rent, yield_pct, inv_score, strategy,
 # CALCULATION FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _calc_value(sales: list, region: str, floor_area: float, beds: int = 3, prop_type: str = "") -> int:
-    # Regional price-per-sqm benchmarks (2024, £/sqm)
+def _calc_value(sales: list, region: str, floor_area: float, beds: int = 3,
+                prop_type: str = "", ukhpi_district_avg: int = 0) -> int:
+    # Regional price-per-sqm benchmarks (2024, £/sqm median)
     _PSM = {
         "london": 7500, "south east": 4200, "east of england": 3400,
         "south west": 3200, "east midlands": 2400, "west midlands": 2500,
         "north west": 2300, "yorkshire and the humber": 2000,
         "north east": 1800, "wales": 2000, "scotland": 2200, "default": 2600,
     }
+    psm = next((v for k, v in _PSM.items() if k != "default" and k in region), _PSM["default"])
 
     if not sales:
-        # Fallback: capitalise rent at ~5.5% yield
         rent_anchor = _voa_rent(region, beds) * 12 * 18
-        if floor_area >= 30:
-            psm = next((v for k, v in _PSM.items() if k != "default" and k in region), _PSM["default"])
-            return max(int(floor_area * psm), rent_anchor)
-        return rent_anchor
+        sqm_anchor  = int(floor_area * psm) if floor_area >= 30 else 0
+        anchors = [a for a in [rent_anchor, sqm_anchor, ukhpi_district_avg] if a > 40_000]
+        return int(sum(anchors) / len(anchors)) if anchors else rent_anchor
 
     today = date.today()
-    pt_norm = prop_type.lower().split("/")[-1]  # handle URI fragments like ".../terraced"
-    weighted = []
+    pt_norm = prop_type.lower().split("/")[-1]
+    annual_rate = _get_growth(region) / 100
+
+    # Build (price, weight) pairs — time-adjust each sale to today's value
+    pairs = []
     for s in sales:
         price = s.get("price_gbp", 0)
         if not price:
@@ -1000,26 +1050,48 @@ def _calc_value(sales: list, region: str, floor_area: float, beds: int = 3, prop
             months_ago = (today.year - sd.year) * 12 + (today.month - sd.month)
         except Exception:
             months_ago = 24
-        # Recency weight
-        w = 3 if months_ago <= 12 else 2 if months_ago <= 24 else 1
-        # Boost same property type by 50%
+
+        # Inflate historic price to today using regional ONS growth rate
+        today_price = int(price * ((1 + annual_rate) ** (months_ago / 12)))
+
+        # Recency weight (even after inflation, recent sales are more reliable)
+        w = 4 if months_ago <= 6 else 3 if months_ago <= 12 else 2 if months_ago <= 24 else 1
+        # Same property type gets +50% weight
         if pt_norm and pt_norm in s.get("property_type", "").lower():
             w = max(w + 1, int(w * 1.5))
-        weighted.extend([price] * w)
+        pairs.append((today_price, w))
 
-    if not weighted:
+    if not pairs:
         return 0
 
-    weighted.sort()
+    # Outlier trimming: remove bottom 10% and top 10% by price (min 4 sales)
+    raw_prices = sorted(p for p, _ in pairs)
+    if len(raw_prices) >= 6:
+        trim = max(1, len(raw_prices) // 10)
+        lo, hi = raw_prices[trim], raw_prices[-trim - 1]
+        pairs = [(p, w) for p, w in pairs if lo <= p <= hi]
+
+    # Expand to weighted list and take median
+    weighted = sorted(p for p, w in pairs for _ in range(w))
+    if not weighted:
+        return 0
     mid = len(weighted) // 2
     comp_value = int((weighted[mid - 1] + weighted[mid]) / 2) if len(weighted) % 2 == 0 else weighted[mid]
 
-    # Blend with price-per-sqm anchor when we have reliable floor area
-    if floor_area >= 30 and len(sales) >= 3:
-        psm = next((v for k, v in _PSM.items() if k != "default" and k in region), _PSM["default"])
-        sqm_anchor = int(floor_area * psm)
-        # 65% comparables (more reliable with enough data), 35% sqm anchor
+    # --- Multi-anchor blending ---
+    sqm_anchor = int(floor_area * psm) if floor_area >= 30 else 0
+    has_sqm    = sqm_anchor > 40_000
+    has_ukhpi  = ukhpi_district_avg > 40_000
+
+    if has_sqm and has_ukhpi:
+        # All three: 55% comps, 25% sqm, 20% UKHPI
+        comp_value = int(comp_value * 0.55 + sqm_anchor * 0.25 + ukhpi_district_avg * 0.20)
+    elif has_sqm:
+        # 65% comps, 35% sqm (existing behaviour)
         comp_value = int(comp_value * 0.65 + sqm_anchor * 0.35)
+    elif has_ukhpi:
+        # 75% comps, 25% UKHPI sanity check
+        comp_value = int(comp_value * 0.75 + ukhpi_district_avg * 0.25)
 
     return max(comp_value, 40_000)
 
