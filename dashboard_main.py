@@ -876,7 +876,7 @@ async def _fetch_epc(postcode: str) -> list:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 EPC_URL,
-                params={"postcode": postcode, "size": 5},
+                params={"postcode": postcode, "size": 25},
                 headers={"Accept": "application/json", "Authorization": f"Basic {creds}"},
             )
             if resp.status_code == 200:
@@ -1243,12 +1243,22 @@ def _detect_tenure_type(epc: dict, sales: list, imd_decile: int) -> dict:
 
 
 def _best_epc(epc_list: list) -> dict:
-    """Pick the most recent EPC record from a list."""
+    """Pick the most informative recent EPC record from a list.
+
+    Prefer records that have a direct bedroom count; within that preference
+    pick the most recently lodged certificate.
+    """
     if not epc_list:
         return {}
+
     def _epc_date(e):
         return e.get("lodgement-date") or e.get("lodgement_date") or e.get("inspection-date") or "1900-01-01"
-    return max(epc_list, key=_epc_date)
+
+    def _sort_key(e):
+        has_beds = 1 if (e.get("number-of-bedrooms") or e.get("number_of_bedrooms")) is not None else 0
+        return (has_beds, _epc_date(e))
+
+    return max(epc_list, key=_sort_key)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1534,7 +1544,17 @@ def _infer_bedrooms(epc: dict) -> int:
     floor_area = _f(epc.get("total-floor-area") or epc.get("floor_area_sqm"), 0.0)
     is_flat    = "flat" in prop_type or "maisonette" in prop_type
 
-    # Signal A: EPC certified habitable room count
+    # Signal 0: direct EPC bedroom count — most authoritative field, use it outright
+    direct_raw = epc.get("number-of-bedrooms") or epc.get("number_of_bedrooms")
+    if direct_raw is not None:
+        try:
+            b = int(direct_raw)
+            if 1 <= b <= 10:
+                return b
+        except (ValueError, TypeError):
+            pass
+
+    # Signal A: EPC certified habitable room count (includes reception rooms)
     beds_rooms = None
     rooms_raw  = epc.get("number-habitable-rooms") or epc.get("number_habitable_rooms")
     if rooms_raw:
@@ -1567,18 +1587,14 @@ def _infer_bedrooms(epc: dict) -> int:
         return beds_rooms if diff <= 1 else beds_area
 
     # Houses: floor area thresholds have uncertainty near boundaries (±8 sqm).
-    # When floor_area sits close to a threshold, habitable rooms is the better signal
-    # because it directly measures room count rather than inferring from total sqm.
+    # Prefer habitable rooms near a boundary; floor area otherwise.
     thresholds = _HOUSE_THRESHOLDS
     near_boundary = any(abs(floor_area - t) < 8 for t in thresholds)
 
     if diff == 1:
-        # Small disagreement: prefer habitable rooms near a boundary
-        # (floor area in the 'grey zone'), otherwise prefer floor area
         return beds_rooms if near_boundary else beds_area
     else:
-        # Large disagreement (≥2): floor area is usually more reliable for houses;
-        # habitable-room subtraction has the largest errors at extremes
+        # Large disagreement (≥2): floor area is more reliable for houses
         return beds_area
 
 
