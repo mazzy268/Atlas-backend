@@ -197,16 +197,20 @@ async def analyse_property(request: Request):
         _fetch_demographics(rpc),
         _fetch_flood(lat, lng),
         _fetch_transport(lat, lng),
+        _fetch_planning_data(lat, lng),
+        _fetch_schools(lat, lng),
         return_exceptions=True,
     )
 
-    sales     = _sr(fetched[0], [])
-    epc_list  = _sr(fetched[1], [])
-    crime_d   = _sr(fetched[2], {})
-    demo_d    = _sr(fetched[3], {})
-    flood_d   = _sr(fetched[4], {})
-    trans_d   = _sr(fetched[5], {})
-    epc       = epc_list[0] if epc_list else {}
+    sales      = _sr(fetched[0], [])
+    epc_list   = _sr(fetched[1], [])
+    crime_d    = _sr(fetched[2], {})
+    demo_d     = _sr(fetched[3], {})
+    flood_d    = _sr(fetched[4], {})
+    trans_d    = _sr(fetched[5], {})
+    planning_d = _sr(fetched[6], {})
+    schools_d  = _sr(fetched[7], [])
+    epc        = _best_epc(epc_list)  # most recent certificate for this postcode
 
     # Use postcodes.io region (proper name like "North East") over Nominatim's "England"
     region = demo_d.get("region", region).lower() if demo_d.get("region") else region
@@ -222,6 +226,13 @@ async def analyse_property(request: Request):
     crime_sc    = _crime_score(crime_tot)
     trans_sc    = trans_d.get("transport_score", 0)
     flood_lv    = flood_d.get("risk_level", "Unknown")
+
+    # Property character — council/tenure detection and construction era
+    imd_decile    = _i(demo_d.get("imd_decile"), 5)
+    tenure_info   = _detect_tenure_type(epc, sales, imd_decile)
+    construction  = _construction_era(epc)
+    built_form    = epc.get("built-form") or epc.get("built_form") or "Unknown"
+    ext_count     = _i(epc.get("extension-count"), 0)
 
     # UKHPI district anchor — official LR average price for this local authority
     ukhpi_price = await _fetch_ukhpi_price(demo_d.get("admin_district", ""))
@@ -297,15 +308,22 @@ async def analyse_property(request: Request):
             "bathrooms": max(1, beds - 1),
             "floor_area_sqm": floor_area,
             "property_type": prop_type,
+            "built_form": built_form,
+            "construction_era": construction,
+            "extensions": ext_count,
+            "tenure_category": tenure_info["category"],
+            "tenure_label": tenure_info["label"],
+            "is_social_housing": tenure_info["is_social_housing"],
             "epc_rating": epc_rating,
             "epc_current_efficiency": _i(epc.get("current-energy-efficiency") or epc.get("current_energy_efficiency"), 0),
             "epc_potential_rating": epc.get("potential-energy-rating") or epc.get("potential_energy_rating"),
-            "tenure": sales[0].get("tenure") if sales else "Unknown",
-            "construction": epc.get("built-form") or epc.get("built_form") or "Unknown",
+            "legal_tenure": sales[0].get("tenure") if sales else "Unknown",
             "walls": epc.get("walls-description") or epc.get("walls_description"),
             "roof": epc.get("roof-description") or epc.get("roof_description"),
             "heating": epc.get("main-heat-description") or epc.get("heating_description"),
             "windows": epc.get("windows-description") or epc.get("windows_description"),
+            "mains_gas": bool(epc.get("mains-gas-flag") or epc.get("mains_gas_flag")),
+            "epc_inspection_date": epc.get("inspection-date") or epc.get("lodgement-date"),
         },
 
         "financials": {
@@ -404,9 +422,9 @@ async def analyse_property(request: Request):
             "transport_summary": _transport_summary(trans_d),
             "nearest_stations": (trans_d.get("nearest_stations") or [])[:3],
             "bus_stop_count": trans_d.get("bus_stop_count", 0),
-            "school_rating": "Good",
-            "best_school": "Check local authority website for details",
-            "schools_nearby": [],
+            "schools_nearby": schools_d,
+            "nearest_school": schools_d[0]["name"] if schools_d else "None found within 1km",
+            "school_count_1km": len(schools_d),
             "demographics": {
                 "area": demo_d.get("area_name") or demo_d.get("admin_district"),
                 "ward": demo_d.get("ward"),
@@ -416,13 +434,17 @@ async def analyse_property(request: Request):
         },
 
         "planning": {
-            "risk_level": "low",
-            "risk_summary": "No major planning risks detected in immediate area.",
-            "article_4_risk": False,
-            "permitted_development_likely": True,
-            "development_opportunity": "Single-storey extensions and loft conversions likely viable under permitted development.",
-            "nearby_applications": [],
-            "total_applications": 0,
+            "risk_level": planning_d.get("risk_level", "low"),
+            "risk_summary": planning_d.get("risk_summary", "No major planning restrictions detected."),
+            "article_4_active": planning_d.get("article_4_active", False),
+            "article_4_directions": planning_d.get("article_4_directions", []),
+            "conservation_area": planning_d.get("conservation_area", False),
+            "conservation_area_name": planning_d.get("conservation_area_name"),
+            "listed_building": planning_d.get("listed_building", False),
+            "listed_building_grade": planning_d.get("listed_building_grade"),
+            "permitted_development_likely": planning_d.get("permitted_development_likely", True),
+            "hmo_pd_blocked": planning_d.get("hmo_pd_blocked", False),
+            "source": "GOV.UK Planning Data API",
         },
 
         "comparables": {
@@ -443,9 +465,14 @@ async def analyse_property(request: Request):
         },
 
         "hmo_analysis": {
-            "feasibility": "Medium" if hmo_rooms > 0 else "Low",
+            "feasibility": "Blocked — Article 4" if planning_d.get("hmo_pd_blocked") else ("Medium" if hmo_rooms > 0 else "Low"),
             "room_potential": hmo_rooms,
-            "hmo_notes": "Article 4 check required. Minimum room sizes and fire safety upgrades apply." if hmo_rooms > 0 else "Property likely too small for HMO.",
+            "article_4_restriction": planning_d.get("hmo_pd_blocked", False),
+            "hmo_notes": (
+                "Article 4 direction active — full planning permission required before HMO conversion."
+                if planning_d.get("hmo_pd_blocked")
+                else ("Minimum room sizes and fire safety upgrades required. Check local HMO licensing scheme." if hmo_rooms > 0 else "Property likely too small for HMO.")
+            ),
             "estimated_monthly_hmo_rent": hmo_rent,
             "hmo_gross_yield": hmo_yield,
             "hmo_cashflow": max(0, hmo_rent - mortgage - 200),
@@ -473,9 +500,13 @@ async def analyse_property(request: Request):
             "demographics": bool(demo_d),
             "flood": flood_lv != "Unknown",
             "transport": trans_sc > 0,
-            "planning": False,
-            "schools": False,
-            "active_count": sum([len(sales) > 0, bool(epc), crime_tot > 0, bool(demo_d), flood_lv != "Unknown", trans_sc > 0]),
+            "planning": planning_d.get("risk_level") is not None,
+            "schools": len(schools_d) > 0,
+            "ukhpi": ukhpi_price > 0,
+            "tenure_detected": tenure_info["category"] != "private",
+            "active_count": sum([len(sales) > 0, bool(epc), crime_tot > 0, bool(demo_d),
+                                  flood_lv != "Unknown", trans_sc > 0,
+                                  planning_d.get("risk_level") is not None, len(schools_d) > 0]),
         },
     }
 
@@ -911,6 +942,196 @@ LIMIT 1
     return 0
 
 
+PLANNING_API = "https://www.planning.data.gov.uk/entity.json"
+
+async def _fetch_planning_data(lat: float, lng: float) -> dict:
+    """Gov.uk Planning Data API — free, no key. Article 4, conservation areas, listed buildings."""
+    datasets = ["article-4-direction", "conservation-area", "listed-building"]
+    results = {}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            fetched = await asyncio.gather(
+                *[client.get(PLANNING_API, params={"longitude": lng, "latitude": lat,
+                                                    "dataset": ds, "limit": 5})
+                  for ds in datasets],
+                return_exceptions=True,
+            )
+        for ds, resp in zip(datasets, fetched):
+            if isinstance(resp, Exception):
+                results[ds] = []
+            elif resp.status_code == 200:
+                results[ds] = resp.json().get("entities", [])
+            else:
+                results[ds] = []
+    except Exception:
+        results = {ds: [] for ds in datasets}
+
+    a4      = results.get("article-4-direction", [])
+    cons    = results.get("conservation-area", [])
+    listed  = results.get("listed-building", [])
+
+    a4_active   = len(a4) > 0
+    cons_active = len(cons) > 0
+    listed_b    = len(listed) > 0
+
+    # Planning risk level for investors
+    if listed_b:
+        risk_level, risk_summary = "high", "Listed building — significant restrictions on alterations and extensions."
+    elif a4_active and cons_active:
+        risk_level, risk_summary = "high", "Article 4 direction and conservation area active — PD rights restricted."
+    elif a4_active:
+        risk_level, risk_summary = "medium", "Article 4 direction in force — permitted development rights may be restricted."
+    elif cons_active:
+        risk_level, risk_summary = "medium", "Conservation area — extensions and alterations subject to additional controls."
+    else:
+        risk_level, risk_summary = "low", "No planning restrictions detected. Standard PD rights likely apply."
+
+    return {
+        "risk_level": risk_level,
+        "risk_summary": risk_summary,
+        "article_4_active": a4_active,
+        "article_4_directions": [e.get("name", "") for e in a4[:3]],
+        "conservation_area": cons_active,
+        "conservation_area_name": cons[0].get("name") if cons else None,
+        "listed_building": listed_b,
+        "listed_building_grade": listed[0].get("listed-building-grade") if listed else None,
+        "permitted_development_likely": not a4_active and not listed_b,
+        "hmo_pd_blocked": a4_active,
+    }
+
+
+async def _fetch_schools(lat: float, lng: float) -> list:
+    """Overpass API for schools within 1km. Returns name, type, distance."""
+    query = f"""
+[out:json][timeout:12];
+(
+  node["amenity"~"school|college|university"](around:1000,{lat},{lng});
+  way["amenity"~"school|college|university"](around:1000,{lat},{lng});
+  node["amenity"="kindergarten"](around:800,{lat},{lng});
+);
+out body center;
+"""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(OVERPASS, data={"data": query})
+            resp.raise_for_status()
+            elements = resp.json().get("elements", [])
+            schools = []
+            seen = set()
+            for e in elements:
+                tags = e.get("tags", {})
+                name = tags.get("name") or tags.get("operator")
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                rlat = e.get("lat") or (e.get("center", {}).get("lat", lat))
+                rlon = e.get("lon") or (e.get("center", {}).get("lon", lng))
+                schools.append({
+                    "name": name,
+                    "type": tags.get("amenity", "school"),
+                    "distance_m": _haversine(lat, lng, rlat, rlon),
+                    "operator": tags.get("operator:type", ""),
+                })
+            return sorted(schools, key=lambda s: s["distance_m"])[:6]
+    except Exception:
+        pass
+    return []
+
+
+def _construction_era(epc: dict) -> str:
+    band = (epc.get("construction-age-band") or epc.get("construction_age_band") or "").lower()
+    if not band or "unknown" in band or "nd" in band:
+        return "Unknown"
+    if "before 1900" in band or "pre-1900" in band:          return "Pre-1900 (Victorian/Edwardian)"
+    if "1900" in band and ("1929" in band or "1919" in band): return "1900–1929 (Interwar)"
+    if "1930" in band or "1949" in band:                      return "1930–1949 (Pre-war)"
+    if "1950" in band or "1966" in band:                      return "1950–1966 (Post-war / early council)"
+    if "1967" in band or "1975" in band:                      return "1967–1975 (Council housing peak)"
+    if "1976" in band or "1982" in band:                      return "1976–1982 (Late council / Thatcher era)"
+    if "1983" in band or "1990" in band:                      return "1983–1990 (1980s build)"
+    if "1991" in band or "2002" in band:                      return "1991–2002 (1990s/2000s)"
+    if "2003" in band or "2011" in band:                      return "2003–2011 (Modern)"
+    if "2012" in band:                                        return "2012+ (New build)"
+    return band.title()
+
+
+def _detect_tenure_type(epc: dict, sales: list, imd_decile: int) -> dict:
+    """Classify property tenure using EPC fields, sale history, and area deprivation."""
+    tenure_raw = (epc.get("tenure") or "").lower()
+    tx_type    = (epc.get("transaction-type") or "").lower()
+    era        = _construction_era(epc)
+    prop_type  = (epc.get("property-type") or "").lower()
+
+    score = 0
+    signals = []
+
+    # EPC direct tenure signals (strongest evidence)
+    if "social" in tenure_raw:
+        score += 8
+        signals.append("EPC tenure: social rented")
+    if "social" in tx_type:
+        score += 6
+        signals.append("EPC transaction type: social rental")
+
+    # Construction era (council housing peak was 1950–1982)
+    if any(x in era for x in ["post-war", "council housing peak", "late council"]):
+        score += 3
+        signals.append(f"Construction era: {era}")
+    elif "1930" in era or "1949" in era:
+        score += 1
+
+    # Property form + era combination
+    if any(x in prop_type for x in ["semi-detached", "mid-terrace", "terraced"]) and score >= 2:
+        score += 1
+        signals.append("Standard council housing form")
+
+    # Deprivation (IMD decile 1-3 = most deprived — correlates with council estates)
+    if imd_decile and imd_decile <= 2:
+        score += 2
+        signals.append(f"Highly deprived area (IMD {imd_decile})")
+    elif imd_decile and imd_decile <= 4:
+        score += 1
+
+    # Right-to-buy evidence: low historic sale price in 1985–2010 window
+    for s in sales:
+        price, sale_date = s.get("price_gbp", 0), s.get("date", "")
+        if sale_date and 1985 <= int(sale_date[:4]) <= 2010 and 0 < price < 70_000:
+            score += 3
+            signals.append(f"Possible Right to Buy sale £{price:,} in {sale_date[:4]}")
+            break
+
+    if score >= 8:
+        label, category = "Council / Social Housing", "social_rented"
+    elif score >= 5:
+        label, category = "Likely Council / Housing Association", "probable_social"
+    elif score >= 3:
+        label, category = "Possibly Former Council Property", "former_council"
+    elif "private" in tenure_raw:
+        label, category = "Private Rented", "private_rented"
+    elif "owner" in tenure_raw:
+        label, category = "Owner Occupied", "owner_occupied"
+    else:
+        label, category = "Private / Owner Occupied", "private"
+
+    return {
+        "category": category,
+        "label": label,
+        "confidence_score": min(score, 10),
+        "signals": signals,
+        "epc_tenure_raw": tenure_raw or "not recorded",
+        "is_social_housing": score >= 5,
+    }
+
+
+def _best_epc(epc_list: list) -> dict:
+    """Pick the most recent EPC record from a list."""
+    if not epc_list:
+        return {}
+    def _epc_date(e):
+        return e.get("lodgement-date") or e.get("lodgement_date") or e.get("inspection-date") or "1900-01-01"
+    return max(epc_list, key=_epc_date)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # AI VIA HUGGING FACE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1163,20 +1384,20 @@ def _calc_momentum(sales: list) -> float:
 
 
 def _beds_from_floor_area(floor_area: float, prop_type: str = "") -> int:
-    """Infer bedrooms from certified EPC floor area using UK average room sizes."""
+    """Infer bedrooms from certified EPC floor area using ONS/HCA average UK dwelling sizes."""
     is_flat = "flat" in prop_type or "maisonette" in prop_type
     if is_flat:
-        # Flats are smaller per bedroom
-        if floor_area < 42:  return 1
-        if floor_area < 62:  return 2
-        if floor_area < 88:  return 3
+        if floor_area < 42:  return 1   # studio/small 1-bed flat
+        if floor_area < 63:  return 2   # standard 1-2 bed flat
+        if floor_area < 88:  return 3   # 2-3 bed flat
         return 4
     else:
-        # Houses — based on ONS/HCA average dwelling sizes by bedroom count
-        if floor_area < 58:   return 2   # small 2-bed / cottage
-        if floor_area < 82:   return 3   # standard 2–3 bed (avg 2-bed ~70sqm)
-        if floor_area < 106:  return 3   # standard 3-bed (avg ~90sqm)
-        if floor_area < 140:  return 4
+        # Houses — ONS EHS 2022 average sizes by bedroom count:
+        # 1-bed ~48sqm, 2-bed ~67sqm, 3-bed ~88sqm (terraced/semi), 4-bed ~120sqm
+        if floor_area < 55:   return 1   # very small / 1-bed cottage / bedsit house
+        if floor_area < 73:   return 2   # standard 2-bed house
+        if floor_area < 105:  return 3   # standard 3-bed terraced/semi/council
+        if floor_area < 138:  return 4
         return max(5, int(floor_area / 28))
 
 
@@ -1191,26 +1412,27 @@ def _infer_bedrooms(epc: dict) -> int:
     if rooms_raw:
         try:
             r = int(rooms_raw)
-            # UK layout: flats & small houses have 1 reception; larger houses have 2
+            # Flats almost always have 1 reception; houses with 5+ rooms often have 2
             receptions = 1 if (is_flat or r <= 4) else 2
             beds_rooms = max(1, r - receptions)
         except (ValueError, TypeError):
             pass
 
-    # Secondary: floor area inference
+    # Secondary: floor area inference (ONS-calibrated thresholds)
     beds_area = _beds_from_floor_area(floor_area, prop_type) if floor_area >= 30 else None
 
-    # Reconcile both signals
+    # Reconcile: for houses, floor area is more reliable than habitable-room subtraction
+    # (reception count ambiguity is the main source of error in habitable-rooms formula)
     if beds_rooms is not None and beds_area is not None:
-        diff = abs(beds_rooms - beds_area)
-        if diff <= 1:
-            return beds_rooms          # both agree — trust certified EPC count
-        return round((beds_rooms + beds_area) / 2)  # disagree — split the difference
-    if beds_rooms is not None:
-        return beds_rooms
-    if beds_area is not None:
-        return beds_area
-    return 3  # UK median default
+        if beds_rooms == beds_area:
+            return beds_rooms                        # perfect agreement
+        if is_flat:
+            # Flats: EPC room count is reliable (1 reception), trust it unless large diff
+            return beds_rooms if abs(beds_rooms - beds_area) <= 1 else beds_area
+        else:
+            # Houses: floor area wins — removes reception-count ambiguity entirely
+            return beds_area
+    return beds_rooms if beds_rooms is not None else (beds_area if beds_area is not None else 3)
 
 
 def _investment_score(g_yield, crime_sc, transport, flood, sales) -> int:
