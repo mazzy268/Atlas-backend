@@ -734,35 +734,19 @@ async def health():
 
 @app.get("/debug/epc")
 async def debug_epc(postcode: str):
-    """Return raw EPC data for a postcode so we can see which fields are present."""
+    """Compact EPC debug — easy to read and share."""
     records = await _fetch_epc(postcode)
     best = _best_epc(records)
-    inferred = _infer_bedrooms(best)
     return {
-        "postcode": postcode,
-        "record_count": len(records),
-        "best_record_fields": {
-            "number-of-bedrooms": best.get("number-of-bedrooms"),
-            "number-habitable-rooms": best.get("number-habitable-rooms"),
-            "total-floor-area": best.get("total-floor-area"),
-            "property-type": best.get("property-type"),
-            "built-form": best.get("built-form"),
-            "lodgement-date": best.get("lodgement-date"),
-            "address1": best.get("address1"),
-            "address2": best.get("address2"),
-        },
-        "all_records_summary": [
-            {
-                "address": r.get("address1", "") + " " + r.get("address2", ""),
-                "number-of-bedrooms": r.get("number-of-bedrooms"),
-                "number-habitable-rooms": r.get("number-habitable-rooms"),
-                "total-floor-area": r.get("total-floor-area"),
-                "property-type": r.get("property-type"),
-                "lodgement-date": r.get("lodgement-date"),
-            }
-            for r in records
-        ],
-        "inferred_bedrooms": inferred,
+        "n": len(records),
+        "beds_direct": best.get("number-of-bedrooms"),
+        "hab_rooms": best.get("number-habitable-rooms"),
+        "floor_area": best.get("total-floor-area"),
+        "type": best.get("property-type"),
+        "date": best.get("lodgement-date"),
+        "addr": (best.get("address1") or "") + " " + (best.get("address2") or ""),
+        "inferred": _infer_bedrooms(best),
+        "all": [{"a": r.get("address1"), "beds": r.get("number-of-bedrooms"), "hab": r.get("number-habitable-rooms"), "sqm": r.get("total-floor-area"), "dt": r.get("lodgement-date")} for r in records],
     }
 
 
