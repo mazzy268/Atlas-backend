@@ -296,10 +296,17 @@ async def analyse_property(request: Request):
     dev_sc      = (25 if loft_ok else 0) + (30 if ext_ok else 0) + 20
 
     hmo_rooms   = max(0, beds - 1) if beds >= 4 else 0
-    hmo_rent    = hmo_rooms * 550 if hmo_rooms > 0 else 0
+    hmo_room_r  = _hmo_room_rent(region)
+    hmo_rent    = hmo_rooms * hmo_room_r if hmo_rooms > 0 else 0
     hmo_yield   = round(hmo_rent * 12 / est_value * 100, 2) if est_value and hmo_rent else 0.0
 
-    stamp       = _stamp_duty(est_value)
+    stamp           = _stamp_duty(est_value, investor=True)
+    purchase_costs  = _purchase_costs(est_value, region)
+    mortgage_scens  = _mortgage_scenarios(est_value, rent, region)
+    tax_anal        = _tax_analysis(rent, mortgage, est_value)
+    ten_yr          = _ten_year_model(est_value, rent, growth_r, region)
+    brrrr           = _brrrr_analysis(est_value, rent, region, floor_area)
+    cgt             = _cgt_estimate(est_value, int(est_value / 1.25))
 
     # Step 4: AI analysis
     ai = await _run_ai(
@@ -349,17 +356,19 @@ async def analyse_property(request: Request):
         },
 
         "financials": {
-            "estimated_value": est_value,
-            "monthly_rent": rent,
-            "annual_rent": rent * 12,
-            "rental_yield": g_yield,
-            "net_yield": net_yield,
-            "monthly_cashflow": cashflow,
-            "annual_profit": annual_p,
+            "estimated_value":          est_value,
+            "monthly_rent":             rent,
+            "annual_rent":              rent * 12,
+            "rental_yield":             g_yield,
+            "net_yield":                net_yield,
+            "monthly_cashflow":         cashflow,
+            "annual_profit":            annual_p,
             "monthly_mortgage_estimate": mortgage,
-            "deposit_required": deposit,
-            "stamp_duty_estimate": stamp,
-            "total_acquisition_cost": deposit + stamp + 2500,
+            "deposit_required":         deposit,
+            "stamp_duty_estimate":      stamp,
+            "total_acquisition_cost":   purchase_costs["total_funds_needed_25pct"],
+            "purchase_costs_breakdown": purchase_costs,
+            "mortgage_scenarios":       mortgage_scens,
         },
 
         "scores": {
@@ -520,18 +529,26 @@ async def analyse_property(request: Request):
         },
 
         "hmo_analysis": {
-            "feasibility": "Blocked — Article 4" if planning_d.get("hmo_pd_blocked") else ("Medium" if hmo_rooms > 0 else "Low"),
-            "room_potential": hmo_rooms,
-            "article_4_restriction": planning_d.get("hmo_pd_blocked", False),
+            "feasibility": "Blocked — Article 4" if planning_d.get("hmo_pd_blocked") else ("High" if hmo_rooms >= 4 else "Medium" if hmo_rooms > 0 else "Low"),
+            "room_potential":            hmo_rooms,
+            "room_rent_estimate":        hmo_room_r,
+            "article_4_restriction":     planning_d.get("hmo_pd_blocked", False),
             "hmo_notes": (
                 "Article 4 direction active — full planning permission required before HMO conversion."
                 if planning_d.get("hmo_pd_blocked")
-                else ("Minimum room sizes and fire safety upgrades required. Check local HMO licensing scheme." if hmo_rooms > 0 else "Property likely too small for HMO.")
+                else (f"Convert to {hmo_rooms}-room HMO. Mandatory licence required for 5+ occupants. Check council's additional licensing scheme for smaller HMOs." if hmo_rooms > 0 else "Property likely too small for HMO — typically need 4+ bedrooms.")
             ),
             "estimated_monthly_hmo_rent": hmo_rent,
-            "hmo_gross_yield": hmo_yield,
-            "hmo_cashflow": max(0, hmo_rent - mortgage - 200),
+            "hmo_gross_yield":           hmo_yield,
+            "hmo_cashflow":              max(0, hmo_rent - mortgage - int(hmo_rent * 0.15)),
+            "conversion_cost_estimate":  hmo_rooms * 4500,
+            "hmo_vs_btl_extra_monthly":  max(0, hmo_rent - rent),
         },
+
+        "tax_analysis":   tax_anal,
+        "brrrr_analysis": brrrr,
+        "exit_analysis":  cgt,
+        "ten_year_model": ten_yr,
 
         "confidence": _confidence_score(sales, epc, demo_d, crime_tot),
 
@@ -542,9 +559,11 @@ async def analyse_property(request: Request):
         },
 
         "data_freshness": {
-            "price": f"Latest sale: {sales[0].get('date','Unknown')[:7]}" if sales else "No sales data found",
-            "rent": "VOA Private Rental Market Statistics 2024",
-            "crime": "Police API — current month",
+            "price":        f"Latest sale: {sales[0].get('date','Unknown')[:7]}" if sales else "No sales data found",
+            "rent":         "VOA Private Rental Market Statistics 2023-24",
+            "growth":       "ONS UK HPI November 2024",
+            "crime":        "Police API — rolling 12 months",
+            "tax_rates":    "HMRC SDLT + HMRC CGT rates 2024-25",
             "last_updated": datetime.utcnow().isoformat(),
         },
 
@@ -746,7 +765,7 @@ async def get_development(address: str, postcode: str):
 async def health():
     return {
         "status": "ok",
-        "version": "4.2.0",
+        "version": "5.0.0",
         "database": "none — stateless deployment",
         "hf_configured": bool(HF_API_KEY),
         "epc_configured": bool(EPC_API_KEY),
@@ -1743,20 +1762,25 @@ def _crime_score(total: int) -> int:
 
 
 def _recommend_strategy(g_yield, beds, floor_area, region) -> str:
-    if g_yield >= 10 and beds >= 4: return "HMO"
-    if any(r in region for r in ["london", "oxford", "cambridge", "bath"]): return "SA"
-    if g_yield >= 6: return "BTL"
-    if g_yield < 4: return "Flip"
+    sa_markets = ["london", "oxford", "cambridge", "bath", "edinburgh", "york",
+                  "chester", "brighton", "bristol", "manchester", "liverpool"]
+    if beds >= 4 and g_yield >= 8:           return "HMO"
+    if any(r in region for r in sa_markets): return "SA"
+    if g_yield >= 6:                         return "BTL"
+    if floor_area >= 80 and g_yield < 5:     return "BRRRR"
+    if g_yield < 4:                          return "Flip"
     return "BTL"
 
 
 def _all_strategies(g_yield, beds, floor_area) -> list:
-    s = ["BTL"]
-    if beds >= 4: s.append("HMO")
-    if g_yield < 5: s.append("Flip")
-    if floor_area >= 120: s.append("BRRR")
+    s = []
+    if beds >= 3 and g_yield >= 6:   s.append("BTL")
+    if beds >= 4:                    s.append("HMO")
+    if floor_area >= 70:             s.append("BRRRR")
+    if g_yield < 5:                  s.append("Flip")
     s.append("SA")
-    return list(dict.fromkeys(s))[:4]
+    s.append("BTL")
+    return list(dict.fromkeys(s))[:5]
 
 
 def _loft_viable(prop_type: str, epc: dict) -> bool:
@@ -1797,10 +1821,196 @@ def _best_deal(sales: list) -> Optional[dict]:
     return deals[0] if deals else None
 
 
-def _stamp_duty(price: int) -> int:
-    if not price or price <= 250000: return 0
-    if price <= 925000: return int((price - 250000) * 0.05)
-    return int(675000 * 0.05 + (price - 925000) * 0.10)
+def _stamp_duty(price: int, investor: bool = True) -> int:
+    """SDLT calculation. investor=True adds the 5% surcharge (raised Oct 2024)."""
+    if not price:
+        return 0
+    sur = 0.05 if investor else 0.0
+    # Bands from 1 April 2025
+    brackets = [(125_000, 0.00), (125_000, 0.02), (675_000, 0.05), (575_000, 0.10), (float("inf"), 0.12)]
+    tax, remaining = 0, price
+    for band, rate in brackets:
+        chunk = min(remaining, band)
+        tax += int(chunk * (rate + sur))
+        remaining -= chunk
+        if remaining <= 0:
+            break
+    return tax
+
+
+def _purchase_costs(price: int, region: str) -> dict:
+    """Full acquisition cost breakdown for a BTL investor."""
+    sdlt        = _stamp_duty(price, investor=True)
+    legal       = 1800 if price < 300_000 else 2500
+    survey      = 700 if price < 200_000 else 900 if price < 400_000 else 1200
+    mortgage_fee = 1500
+    broker_fee  = 500
+    search_fees = 400
+    total       = sdlt + legal + survey + mortgage_fee + broker_fee + search_fees
+    deposit_25  = int(price * 0.25)
+    deposit_20  = int(price * 0.20)
+    return {
+        "stamp_duty_sdlt":    sdlt,
+        "legal_fees":         legal,
+        "survey":             survey,
+        "mortgage_arrangement": mortgage_fee,
+        "broker_fee":         broker_fee,
+        "search_fees":        search_fees,
+        "total_transaction_costs": total,
+        "total_funds_needed_25pct": deposit_25 + total,
+        "total_funds_needed_20pct": deposit_20 + total,
+        "note": "SDLT includes 5% additional-property surcharge (Oct 2024 rate)",
+    }
+
+
+# ── Regional HMO per-room rents (Spareroom 2024 data) ────────────────────────
+HMO_ROOM_RENTS = {
+    "london": 950, "south east": 650, "east of england": 580,
+    "south west": 560, "east midlands": 480, "west midlands": 490,
+    "north west": 510, "yorkshire and the humber": 460,
+    "north east": 425, "wales": 440, "scotland": 520,
+    "default": 500,
+}
+
+
+def _hmo_room_rent(region: str) -> int:
+    for key, v in HMO_ROOM_RENTS.items():
+        if key != "default" and key in region:
+            return v
+    return HMO_ROOM_RENTS["default"]
+
+
+def _mortgage_scenarios(value: int, monthly_rent: int, region: str) -> dict:
+    """Return BTL mortgage cashflow for four deposit/rate combinations."""
+    scenarios = {}
+    for dep_pct, label in [(0.25, "25pct"), (0.20, "20pct")]:
+        for rate, rlabel in [(0.045, "4.5pct"), (0.055, "5.5pct")]:
+            loan      = int(value * (1 - dep_pct))
+            monthly_i = int(loan * rate / 12)          # interest-only
+            cashflow  = monthly_rent - monthly_i - int(monthly_rent * 0.10) - int(value * 0.005 / 12)
+            gross_y   = round(monthly_rent * 12 / value * 100, 2) if value else 0
+            scenarios[f"dep{label}_rate{rlabel}"] = {
+                "deposit_pct":     int(dep_pct * 100),
+                "deposit_gbp":     int(value * dep_pct),
+                "loan_gbp":        loan,
+                "rate_pct":        rate * 100,
+                "monthly_interest": monthly_i,
+                "monthly_cashflow": cashflow,
+                "annual_cashflow":  cashflow * 12,
+                "gross_yield_pct":  gross_y,
+            }
+    return scenarios
+
+
+def _tax_analysis(monthly_rent: int, mortgage_interest: int, value: int) -> dict:
+    """Section 24 impact for basic-rate and higher-rate taxpayers."""
+    annual_rent    = monthly_rent * 12
+    annual_mi      = mortgage_interest * 12
+    expenses       = int(annual_rent * 0.15)   # mgmt + maintenance estimate
+
+    def _calc(tax_rate):
+        # Pre-S24 (old system for reference)
+        pre_taxable  = max(0, annual_rent - annual_mi - expenses)
+        pre_tax      = int(pre_taxable * tax_rate)
+        pre_profit   = annual_rent - annual_mi - expenses - pre_tax
+
+        # Post-S24 (current system)
+        post_taxable = max(0, annual_rent - expenses)
+        post_tax     = int(post_taxable * tax_rate) - int(annual_mi * 0.20)
+        post_tax     = max(0, post_tax)
+        post_profit  = annual_rent - annual_mi - expenses - post_tax
+        return {
+            "annual_profit_gbp":     post_profit,
+            "annual_tax_gbp":        post_tax,
+            "effective_tax_rate_pct": round(post_tax / annual_rent * 100, 1) if annual_rent else 0,
+            "section24_annual_cost": max(0, post_tax - int(pre_taxable * tax_rate)),
+        }
+
+    return {
+        "annual_rent":          annual_rent,
+        "annual_mortgage_interest": annual_mi,
+        "estimated_expenses":   expenses,
+        "basic_rate_20pct":     _calc(0.20),
+        "higher_rate_40pct":    _calc(0.40),
+        "note": "Section 24 removes mortgage interest deduction; 20% tax credit applies instead.",
+    }
+
+
+def _ten_year_model(value: int, rent: int, growth_rate: float, region: str) -> list:
+    """Year-by-year projection: value, equity (25% deposit), cashflow, total return."""
+    deposit     = int(value * 0.25)
+    loan        = value - deposit
+    rate        = 0.050
+    m_interest  = int(loan * rate / 12)
+    rent_growth = 0.035   # ~3.5% pa rent inflation
+    rows = []
+    cum_cashflow = 0
+    for yr in range(1, 11):
+        proj_value  = int(value * ((1 + growth_rate / 100) ** yr))
+        proj_rent   = int(rent * ((1 + rent_growth) ** yr))
+        m_costs     = m_interest + int(proj_rent * 0.10) + int(proj_value * 0.005 / 12)
+        m_cashflow  = proj_rent - m_costs
+        cum_cashflow += m_cashflow * 12
+        equity      = proj_value - loan
+        total_return = (equity - deposit + cum_cashflow)
+        roi_pct     = round(total_return / deposit * 100, 1) if deposit else 0
+        rows.append({
+            "year":             yr,
+            "projected_value":  proj_value,
+            "projected_rent":   proj_rent,
+            "annual_cashflow":  m_cashflow * 12,
+            "cumulative_cashflow": cum_cashflow,
+            "equity":           equity,
+            "total_return":     total_return,
+            "roi_on_deposit_pct": roi_pct,
+        })
+    return rows
+
+
+def _cgt_estimate(value: int, purchase_price: int, years_held: int = 5) -> dict:
+    """Rough CGT estimate on exit for a higher-rate taxpayer."""
+    gain          = max(0, value - purchase_price)
+    allowance     = 3_000       # 2024-25 annual CGT allowance
+    taxable_gain  = max(0, gain - allowance)
+    cgt_higher    = int(taxable_gain * 0.24)   # 24% CGT on residential (post Apr 2024)
+    cgt_basic     = int(taxable_gain * 0.18)
+    net_higher    = value - purchase_price - cgt_higher
+    return {
+        "estimated_gain":       gain,
+        "annual_cgt_allowance": allowance,
+        "taxable_gain":         taxable_gain,
+        "cgt_higher_rate_24pct": cgt_higher,
+        "cgt_basic_rate_18pct":  cgt_basic,
+        "net_proceeds_higher_rate": net_higher,
+        "note": "CGT rates from April 2024. Consult a tax adviser for personal circumstances.",
+    }
+
+
+def _brrrr_analysis(value: int, rent: int, region: str, floor_area: float) -> dict:
+    """BRRRR (Buy, Refurb, Rent, Refinance, Repeat) viability."""
+    refurb_cost   = int(floor_area * 450) if floor_area >= 30 else 25_000
+    arv           = int(value * 1.25)    # After-repair value (assume 25% uplift)
+    refi_loan     = int(arv * 0.75)      # 75% LTV refinance
+    cash_left_in  = max(0, (value + refurb_cost) - refi_loan)
+    monthly_i     = int(refi_loan * 0.050 / 12)
+    cashflow      = rent - monthly_i - int(rent * 0.10) - int(arv * 0.005 / 12)
+    cocoR         = round(cashflow * 12 / cash_left_in * 100, 1) if cash_left_in > 0 else 0
+    viable        = cash_left_in < int(value * 0.15) and cashflow > 0
+    return {
+        "viable":              viable,
+        "purchase_price":      value,
+        "estimated_refurb":    refurb_cost,
+        "after_repair_value":  arv,
+        "refinance_loan_75pct": refi_loan,
+        "cash_left_in":        cash_left_in,
+        "monthly_cashflow":    cashflow,
+        "cash_on_cash_return_pct": cocoR,
+        "verdict": (
+            "Strong BRRRR — most capital recycled back out" if viable and cocoR > 8
+            else "Viable BRRRR — some capital remains in deal" if viable
+            else "BRRRR marginal — check purchase price and refurb costs"
+        ),
+    }
 
 
 def _haversine(lat1, lon1, lat2, lon2) -> int:
