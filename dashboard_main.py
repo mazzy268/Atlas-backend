@@ -234,8 +234,9 @@ async def analyse_property(request: Request):
     built_form    = epc.get("built-form") or epc.get("built_form") or "Unknown"
     ext_count     = _i(epc.get("extension-count"), 0)
 
-    # UKHPI district anchor — official LR average price for this local authority
-    ukhpi_price = await _fetch_ukhpi_price(demo_d.get("admin_district", ""))
+    # UKHPI — official LR average price + type-specific price + 6-month trend
+    ukhpi_d     = await _fetch_ukhpi_data(demo_d.get("admin_district", ""), prop_type)
+    ukhpi_price = ukhpi_d.get("type_avg") or ukhpi_d.get("district_avg", 0)
 
     est_value   = _calc_value(sales, region, floor_area, beds, prop_type, ukhpi_price)
     rent        = _voa_rent(region, beds, prop_type, trans_sc, crime_sc)
@@ -362,8 +363,23 @@ async def analyse_property(request: Request):
             "annual_growth_rate_pct": growth_r,
             "one_year_uplift": val_1yr - est_value,
             "five_year_uplift": val_5yr - est_value,
-            "infrastructure_boost_pct": 2.0,
             "source": "ONS House Price Index regional data",
+        },
+
+        "market": {
+            "district_avg_price": ukhpi_d.get("district_avg", 0),
+            "type_avg_price": ukhpi_d.get("type_avg", 0),
+            "price_vs_district_avg": (
+                round((est_value - ukhpi_d["district_avg"]) / ukhpi_d["district_avg"] * 100, 1)
+                if ukhpi_d.get("district_avg") else None
+            ),
+            "six_month_trend_pct": ukhpi_d.get("trend_pct_6m", 0),
+            "market_direction": ukhpi_d.get("trend_label", "Unknown"),
+            "ukhpi_data_period": ukhpi_d.get("data_period", ""),
+            "price_per_sqm": int(est_value / floor_area) if floor_area >= 30 else None,
+            "district_avg_psm": int(ukhpi_d["district_avg"] / 90) if ukhpi_d.get("district_avg") else None,
+            "comparable_count": len(sales),
+            "source": "UKHPI / Land Registry",
         },
 
         "ai_analysis": {
@@ -402,11 +418,15 @@ async def analyse_property(request: Request):
             "overall_score": risk_sc,
             "band": _risk_label(risk_sc),
             "flood_level": flood_lv,
-            "flood_warnings": len(flood_d.get("active_warnings") or []),
+            "flood_zone": flood_d.get("flood_zone", "Unknown"),
+            "flood_zone_label": flood_d.get("flood_zone_label", ""),
+            "flood_warnings": flood_d.get("active_warning_count", 0),
+            "active_flood_warnings": flood_d.get("active_warnings", []),
             "crime_score": crime_sc,
             "crime_total": crime_tot,
             "crime_breakdown": (crime_d.get("by_category") or [])[:5],
-            "economic_vulnerability": _i(demo_d.get("imd_decile"), 5) * 10,
+            "imd_decile": imd_decile,
+            "economic_vulnerability": imd_decile * 10,
             "red_flags": _red_flags(flood_lv, crime_tot, risk_sc),
             "suitable_for": _suitable_for(risk_sc),
         },
@@ -415,7 +435,7 @@ async def analyse_property(request: Request):
             "overall_desirability": _desirability(inv_sc, crime_sc, trans_sc),
             "desirability_score": _area_desirability_score(crime_sc, trans_sc, demo_d),
             "area_trajectory": _trajectory(region, growth_r),
-            "growth_classification": _growth_classification(region, growth_r, crime_tot, demo_d.get("imd_decile")),
+            "growth_classification": _growth_classification(region, growth_r, crime_tot, imd_decile),
             "income_estimate": _income_est(region),
             "investor_appeal": "High" if inv_sc >= 65 else "Medium" if inv_sc >= 45 else "Low",
             "transport_score": trans_sc,
@@ -426,10 +446,20 @@ async def analyse_property(request: Request):
             "nearest_school": schools_d[0]["name"] if schools_d else "None found within 1km",
             "school_count_1km": len(schools_d),
             "demographics": {
-                "area": demo_d.get("area_name") or demo_d.get("admin_district"),
-                "ward": demo_d.get("ward"),
-                "region": demo_d.get("region"),
-                "local_authority": demo_d.get("local_authority") or demo_d.get("admin_district"),
+                "area":                     demo_d.get("area_name") or demo_d.get("admin_district"),
+                "ward":                     demo_d.get("ward"),
+                "region":                   demo_d.get("region"),
+                "local_authority":          demo_d.get("local_authority") or demo_d.get("admin_district"),
+                "lsoa":                     demo_d.get("lsoa", ""),
+                "msoa":                     demo_d.get("msoa", ""),
+                "parliamentary_constituency": demo_d.get("parliamentary_constituency", ""),
+                "police_force":             demo_d.get("police_force", ""),
+                "nhs_icb":                  demo_d.get("nhs_icb", ""),
+                "imd_decile":               imd_decile,
+                "imd_label":                (
+                    "Most deprived 10%" if imd_decile <= 1 else
+                    f"Decile {imd_decile} of 10 (1=most deprived)"
+                ),
             },
         },
 
@@ -451,8 +481,12 @@ async def analyse_property(request: Request):
             "sales": comps,
             "total_transactions": len(sales),
             "avg_price": int(sum(s.get("price_gbp", 0) for s in sales) / len(sales)) if sales else 0,
+            "median_price": int(statistics.median([s.get("price_gbp", 0) for s in sales])) if sales else 0,
+            "min_price": min((s.get("price_gbp", 0) for s in sales), default=0),
+            "max_price": max((s.get("price_gbp", 0) for s in sales), default=0),
             "latest_sale_price": sales[0].get("price_gbp") if sales else 0,
             "latest_sale_date": sales[0].get("date") if sales else None,
+            "price_per_sqm": int(est_value / floor_area) if floor_area >= 30 and est_value else None,
         },
 
         "deals": {
@@ -729,13 +763,25 @@ async def _fetch_demographics(postcode: str) -> dict:
             resp = await client.get(f"{POSTCODES}/{pc}")
             if resp.status_code == 200:
                 r = resp.json().get("result", {})
+                codes = r.get("codes", {})
                 return {
-                    "region":          r.get("region", ""),
-                    "ward":            r.get("admin_ward", ""),
-                    "area_name":       r.get("admin_district", ""),
-                    "local_authority": r.get("admin_district", ""),
-                    "imd_decile":      r.get("imd"),
-                    "admin_district":  r.get("admin_district", ""),
+                    "region":                    r.get("region", ""),
+                    "ward":                      r.get("admin_ward", ""),
+                    "area_name":                 r.get("admin_district", ""),
+                    "local_authority":           r.get("admin_district", ""),
+                    "imd_decile":                r.get("imd"),
+                    "admin_district":            r.get("admin_district", ""),
+                    "lsoa":                      r.get("lsoa", ""),
+                    "msoa":                      r.get("msoa", ""),
+                    "lsoa_code":                 codes.get("lsoa", ""),
+                    "parliamentary_constituency": r.get("parliamentary_constituency", ""),
+                    "country":                   r.get("country", "England"),
+                    "latitude":                  r.get("latitude"),
+                    "longitude":                 r.get("longitude"),
+                    "outcode":                   r.get("outcode", ""),
+                    "nuts_region":               r.get("nuts", ""),
+                    "police_force":              r.get("pfa", ""),
+                    "nhs_icb":                   r.get("ccg", ""),
                 }
     except Exception:
         pass
@@ -860,20 +906,55 @@ async def _fetch_crime(lat: float, lng: float) -> dict:
     return {"total_crimes": 0, "by_category": [], "period": "unavailable"}
 
 
+EA_FLOOD_ZONES = "https://environment.data.gov.uk/arcgis/rest/services/EA/FloodMapForPlanning/MapServer/{layer}/query"
+
 async def _fetch_flood(lat: float, lng: float) -> dict:
+    """
+    Two-source flood assessment:
+    1. EA Flood Map for Planning (ArcGIS) — official planning-grade Zones 1/2/3
+    2. EA Flood Monitoring API — active flood warnings in the vicinity
+    """
+    geo_params = {
+        "geometry": f"{lng},{lat}", "geometryType": "esriGeometryPoint",
+        "inSR": "4326", "spatialRel": "esriSpatialRelIntersects",
+        "outFields": "flood_zone,layer_name", "returnGeometry": "false", "f": "json",
+    }
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(EA_FLOOD, params={"lat": lat, "long": lng, "dist": 2})
-            if resp.status_code == 200:
-                items = resp.json().get("items", [])
-                risk = "High" if len(items) > 2 else "Medium" if len(items) > 0 else "Low"
-                return {
-                    "risk_level":      risk,
-                    "active_warnings": [{"description": i.get("description", "")} for i in items[:3]],
-                }
+        async with httpx.AsyncClient(timeout=12) as client:
+            # Layer 0 = Flood Zone 3 (>1% annual probability), Layer 1 = Zone 2 (0.1–1%)
+            fz3_resp, fz2_resp, warn_resp = await asyncio.gather(
+                client.get(EA_FLOOD_ZONES.format(layer=0), params=geo_params),
+                client.get(EA_FLOOD_ZONES.format(layer=1), params=geo_params),
+                client.get(EA_FLOOD, params={"lat": lat, "long": lng, "dist": 2}),
+                return_exceptions=True,
+            )
+        in_fz3 = (not isinstance(fz3_resp, Exception) and fz3_resp.status_code == 200
+                  and bool(fz3_resp.json().get("features")))
+        in_fz2 = (not isinstance(fz2_resp, Exception) and fz2_resp.status_code == 200
+                  and bool(fz2_resp.json().get("features")))
+        warnings = []
+        if not isinstance(warn_resp, Exception) and warn_resp.status_code == 200:
+            warnings = [{"description": i.get("description", "")}
+                        for i in warn_resp.json().get("items", [])[:3]]
+
+        if in_fz3:
+            zone, risk, label = "Zone 3", "High", "High probability (>1% annual chance). Mortgage/insurance complications likely."
+        elif in_fz2:
+            zone, risk, label = "Zone 2", "Medium", "Medium probability (0.1–1% annual chance). Flood resilience measures advised."
+        else:
+            zone, risk, label = "Zone 1", "Low", "Low probability flood zone. Standard insurance terms likely."
+
+        return {
+            "risk_level":      risk,
+            "flood_zone":      zone,
+            "flood_zone_label": label,
+            "active_warnings": warnings,
+            "active_warning_count": len(warnings),
+            "source":          "EA Flood Map for Planning (ArcGIS) + EA Flood Monitoring API",
+        }
     except Exception:
         pass
-    return {"risk_level": "Unknown", "active_warnings": []}
+    return {"risk_level": "Unknown", "flood_zone": "Unknown", "flood_zone_label": "Data unavailable.", "active_warnings": []}
 
 
 async def _fetch_transport(lat: float, lng: float) -> dict:
@@ -908,38 +989,76 @@ out body;
     return {"transport_score": 0, "nearest_stations": [], "bus_stop_count": 0}
 
 
-async def _fetch_ukhpi_price(admin_district: str) -> int:
-    """UKHPI SPARQL: most recent district-level average house price from Land Registry."""
+async def _fetch_ukhpi_data(admin_district: str, prop_type: str = "") -> dict:
+    """
+    UKHPI SPARQL: last 6 months of LA-level prices, type-specific average, and trend.
+    Returns district_avg, type_avg, trend_pct, and the latest data period.
+    """
     if not admin_district:
-        return 0
+        return {}
     label = admin_district.lower().strip()
     query = f"""
 PREFIX ukhpi: <http://landregistry.data.gov.uk/def/ukhpi/>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-SELECT ?averagePrice ?refPeriod WHERE {{
+SELECT ?averagePrice ?avgDetached ?avgSemi ?avgTerraced ?avgFlat ?refPeriod WHERE {{
   ?area rdfs:label ?lbl .
   FILTER(LCASE(STR(?lbl)) = "{label}")
   ?obs ukhpi:refArea ?area ;
        ukhpi:averagePrice ?averagePrice ;
        ukhpi:refPeriod ?refPeriod .
+  OPTIONAL {{ ?obs ukhpi:averagePriceDetached ?avgDetached }}
+  OPTIONAL {{ ?obs ukhpi:averagePriceSemiDetached ?avgSemi }}
+  OPTIONAL {{ ?obs ukhpi:averagePriceTerraced ?avgTerraced }}
+  OPTIONAL {{ ?obs ukhpi:averagePriceFlatMaisonette ?avgFlat }}
 }}
 ORDER BY DESC(?refPeriod)
-LIMIT 1
+LIMIT 6
 """
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=12) as client:
             resp = await client.get(
                 HMLR,
                 params={"query": query, "output": "json"},
                 headers={"Accept": "application/sparql-results+json"},
             )
             resp.raise_for_status()
-            bindings = resp.json().get("results", {}).get("bindings", [])
-            if bindings and "averagePrice" in bindings[0]:
-                return int(float(bindings[0]["averagePrice"]["value"]))
+            rows = resp.json().get("results", {}).get("bindings", [])
+            if not rows:
+                return {}
+
+        def _val(row, key):
+            return float(row[key]["value"]) if key in row else None
+
+        # Type-specific field selection
+        pt = prop_type.lower()
+        type_key = ("avgFlat" if "flat" in pt or "maisonette" in pt
+                    else "avgDetached" if "detached" in pt and "semi" not in pt
+                    else "avgSemi" if "semi" in pt
+                    else "avgTerraced" if "terrac" in pt
+                    else None)
+
+        prices_all = [_val(r, "averagePrice") for r in rows if "averagePrice" in r]
+        prices_type = [_val(r, type_key) for r in rows if type_key and type_key in r] if type_key else []
+
+        # 6-month trend: compare newest 3 vs oldest 3
+        trend_pct = 0.0
+        if len(prices_all) >= 4:
+            new_avg = sum(p for p in prices_all[:3] if p) / 3
+            old_avg = sum(p for p in prices_all[-3:] if p) / 3
+            if old_avg:
+                trend_pct = round((new_avg - old_avg) / old_avg * 100, 2)
+
+        return {
+            "district_avg":  int(prices_all[0]) if prices_all else 0,
+            "type_avg":       int(prices_type[0]) if prices_type else 0,
+            "trend_pct_6m":  trend_pct,
+            "trend_label":   "Rising" if trend_pct > 1 else "Falling" if trend_pct < -1 else "Stable",
+            "data_period":   rows[-1].get("refPeriod", {}).get("value", "")[:7] + " to " +
+                             rows[0].get("refPeriod", {}).get("value", "")[:7] if rows else "",
+        }
     except Exception:
         pass
-    return 0
+    return {}
 
 
 PLANNING_API = "https://www.planning.data.gov.uk/entity.json"
@@ -1384,21 +1503,30 @@ def _calc_momentum(sales: list) -> float:
 
 
 def _beds_from_floor_area(floor_area: float, prop_type: str = "") -> int:
-    """Infer bedrooms from certified EPC floor area using ONS/HCA average UK dwelling sizes."""
+    """
+    Infer bedrooms from EPC floor area.
+    Thresholds based on ONS English Housing Survey 2022 + NDSS minimum space standards.
+    Key: 3-bed house min (NDSS) = 74sqm; avg UK 2-bed = 67sqm → boundary at 68sqm.
+    """
     is_flat = "flat" in prop_type or "maisonette" in prop_type
     if is_flat:
-        if floor_area < 42:  return 1   # studio/small 1-bed flat
-        if floor_area < 63:  return 2   # standard 1-2 bed flat
-        if floor_area < 88:  return 3   # 2-3 bed flat
+        if floor_area < 42:  return 1
+        if floor_area < 63:  return 2
+        if floor_area < 88:  return 3
         return 4
     else:
-        # Houses — ONS EHS 2022 average sizes by bedroom count:
-        # 1-bed ~48sqm, 2-bed ~67sqm, 3-bed ~88sqm (terraced/semi), 4-bed ~120sqm
-        if floor_area < 55:   return 1   # very small / 1-bed cottage / bedsit house
-        if floor_area < 73:   return 2   # standard 2-bed house
-        if floor_area < 105:  return 3   # standard 3-bed terraced/semi/council
-        if floor_area < 138:  return 4
+        # 2-bed avg ~67sqm; 3-bed avg ~88sqm; NDSS min 3-bed = 74sqm
+        # Use 68sqm as 2→3 boundary to avoid mis-classifying small 3-beds
+        if floor_area < 52:   return 1   # studio or tiny 1-bed house
+        if floor_area < 68:   return 2   # 2-bed (up to NDSS 3-bed minimum)
+        if floor_area < 106:  return 3   # 3-bed (covers council builds ~74-95sqm)
+        if floor_area < 140:  return 4
         return max(5, int(floor_area / 28))
+
+
+# Threshold values for boundary-aware reconciliation
+_HOUSE_THRESHOLDS = [52, 68, 106, 140]
+_FLAT_THRESHOLDS  = [42, 63, 88]
 
 
 def _infer_bedrooms(epc: dict) -> int:
@@ -1406,33 +1534,52 @@ def _infer_bedrooms(epc: dict) -> int:
     floor_area = _f(epc.get("total-floor-area") or epc.get("floor_area_sqm"), 0.0)
     is_flat    = "flat" in prop_type or "maisonette" in prop_type
 
-    # Primary: EPC certified habitable room count
+    # Signal A: EPC certified habitable room count
     beds_rooms = None
-    rooms_raw = epc.get("number-habitable-rooms") or epc.get("number_habitable_rooms")
+    rooms_raw  = epc.get("number-habitable-rooms") or epc.get("number_habitable_rooms")
     if rooms_raw:
         try:
             r = int(rooms_raw)
-            # Flats almost always have 1 reception; houses with 5+ rooms often have 2
+            # Flats = 1 reception; small houses ≤4 rooms = 1 reception; larger = 2 receptions
             receptions = 1 if (is_flat or r <= 4) else 2
             beds_rooms = max(1, r - receptions)
         except (ValueError, TypeError):
             pass
 
-    # Secondary: floor area inference (ONS-calibrated thresholds)
+    # Signal B: floor area → bedroom count via ONS-calibrated thresholds
     beds_area = _beds_from_floor_area(floor_area, prop_type) if floor_area >= 30 else None
 
-    # Reconcile: for houses, floor area is more reliable than habitable-room subtraction
-    # (reception count ambiguity is the main source of error in habitable-rooms formula)
-    if beds_rooms is not None and beds_area is not None:
-        if beds_rooms == beds_area:
-            return beds_rooms                        # perfect agreement
-        if is_flat:
-            # Flats: EPC room count is reliable (1 reception), trust it unless large diff
-            return beds_rooms if abs(beds_rooms - beds_area) <= 1 else beds_area
-        else:
-            # Houses: floor area wins — removes reception-count ambiguity entirely
-            return beds_area
-    return beds_rooms if beds_rooms is not None else (beds_area if beds_area is not None else 3)
+    if beds_rooms is None and beds_area is None:
+        return 3  # UK median default
+    if beds_rooms is None:
+        return beds_area
+    if beds_area is None:
+        return beds_rooms
+
+    # ── Reconcile two signals ──────────────────────────────────────────────────
+    if beds_rooms == beds_area:
+        return beds_rooms  # perfect agreement
+
+    diff = abs(beds_rooms - beds_area)
+
+    if is_flat:
+        # Flats: habitable rooms is very reliable (exactly 1 reception)
+        return beds_rooms if diff <= 1 else beds_area
+
+    # Houses: floor area thresholds have uncertainty near boundaries (±8 sqm).
+    # When floor_area sits close to a threshold, habitable rooms is the better signal
+    # because it directly measures room count rather than inferring from total sqm.
+    thresholds = _HOUSE_THRESHOLDS
+    near_boundary = any(abs(floor_area - t) < 8 for t in thresholds)
+
+    if diff == 1:
+        # Small disagreement: prefer habitable rooms near a boundary
+        # (floor area in the 'grey zone'), otherwise prefer floor area
+        return beds_rooms if near_boundary else beds_area
+    else:
+        # Large disagreement (≥2): floor area is usually more reliable for houses;
+        # habitable-room subtraction has the largest errors at extremes
+        return beds_area
 
 
 def _investment_score(g_yield, crime_sc, transport, flood, sales) -> int:
