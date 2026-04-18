@@ -1162,14 +1162,55 @@ def _calc_momentum(sales: list) -> float:
     return (avg_r - avg_o) / avg_o if avg_o else 0.038
 
 
+def _beds_from_floor_area(floor_area: float, prop_type: str = "") -> int:
+    """Infer bedrooms from certified EPC floor area using UK average room sizes."""
+    is_flat = "flat" in prop_type or "maisonette" in prop_type
+    if is_flat:
+        # Flats are smaller per bedroom
+        if floor_area < 42:  return 1
+        if floor_area < 62:  return 2
+        if floor_area < 88:  return 3
+        return 4
+    else:
+        # Houses — based on ONS/HCA average dwelling sizes by bedroom count
+        if floor_area < 58:   return 2   # small 2-bed / cottage
+        if floor_area < 82:   return 3   # standard 2–3 bed (avg 2-bed ~70sqm)
+        if floor_area < 106:  return 3   # standard 3-bed (avg ~90sqm)
+        if floor_area < 140:  return 4
+        return max(5, int(floor_area / 28))
+
+
 def _infer_bedrooms(epc: dict) -> int:
-    rooms = epc.get("number-habitable-rooms") or epc.get("number_habitable_rooms")
-    if rooms:
+    prop_type  = (epc.get("property-type") or epc.get("property_type") or "").lower()
+    floor_area = _f(epc.get("total-floor-area") or epc.get("floor_area_sqm"), 0.0)
+    is_flat    = "flat" in prop_type or "maisonette" in prop_type
+
+    # Primary: EPC certified habitable room count
+    beds_rooms = None
+    rooms_raw = epc.get("number-habitable-rooms") or epc.get("number_habitable_rooms")
+    if rooms_raw:
         try:
-            return max(1, int(rooms) - 1)
+            r = int(rooms_raw)
+            # UK layout: flats & small houses have 1 reception; larger houses have 2
+            receptions = 1 if (is_flat or r <= 4) else 2
+            beds_rooms = max(1, r - receptions)
         except (ValueError, TypeError):
             pass
-    return 3
+
+    # Secondary: floor area inference
+    beds_area = _beds_from_floor_area(floor_area, prop_type) if floor_area >= 30 else None
+
+    # Reconcile both signals
+    if beds_rooms is not None and beds_area is not None:
+        diff = abs(beds_rooms - beds_area)
+        if diff <= 1:
+            return beds_rooms          # both agree — trust certified EPC count
+        return round((beds_rooms + beds_area) / 2)  # disagree — split the difference
+    if beds_rooms is not None:
+        return beds_rooms
+    if beds_area is not None:
+        return beds_area
+    return 3  # UK median default
 
 
 def _investment_score(g_yield, crime_sc, transport, flood, sales) -> int:
