@@ -216,7 +216,8 @@ async def analyse_property(request: Request):
     region = demo_d.get("region", region).lower() if demo_d.get("region") else region
 
     # Step 3: Derive all values
-    beds        = _infer_bedrooms(epc)
+    # Use majority vote across all EPC records — more robust than one record for a whole postcode
+    beds        = _consensus_bedrooms(epc_list) if epc_list else _infer_bedrooms(epc)
     floor_area  = _f(epc.get("total-floor-area") or epc.get("floor_area_sqm"), 0.0)
     prop_type   = epc.get("property-type") or epc.get("property_type") or "Residential"
     epc_rating  = epc.get("current-energy-rating") or epc.get("current_energy_rating")
@@ -725,7 +726,7 @@ async def get_development(address: str, postcode: str):
 async def health():
     return {
         "status": "ok",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "database": "none — stateless deployment",
         "hf_configured": bool(HF_API_KEY),
         "epc_configured": bool(EPC_API_KEY),
@@ -745,7 +746,8 @@ async def debug_epc(postcode: str):
         "type": best.get("property-type"),
         "date": best.get("lodgement-date"),
         "addr": (best.get("address1") or "") + " " + (best.get("address2") or ""),
-        "inferred": _infer_bedrooms(best),
+        "inferred_best": _infer_bedrooms(best),
+        "inferred_consensus": _consensus_bedrooms(records),
         "all": [{"a": r.get("address1"), "beds": r.get("number-of-bedrooms"), "hab": r.get("number-habitable-rooms"), "sqm": r.get("total-floor-area"), "dt": r.get("lodgement-date")} for r in records],
     }
 
@@ -890,11 +892,14 @@ async def _fetch_epc(postcode: str) -> list:
         return []
     try:
         import base64
+        # EPC API requires spaced format: "NE156DL" → "NE15 6DL"
+        pc = postcode.strip().upper().replace(" ", "")
+        pc_fmt = (pc[:-3] + " " + pc[-3:]) if len(pc) >= 5 else postcode.strip().upper()
         creds = base64.b64encode(f"{EPC_API_EMAIL}:{EPC_API_KEY}".encode()).decode()
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 EPC_URL,
-                params={"postcode": postcode, "size": 25},
+                params={"postcode": pc_fmt, "size": 25},
                 headers={"Accept": "application/json", "Authorization": f"Basic {creds}"},
             )
             if resp.status_code == 200:
@@ -1555,6 +1560,18 @@ def _beds_from_floor_area(floor_area: float, prop_type: str = "") -> int:
 # Threshold values for boundary-aware reconciliation
 _HOUSE_THRESHOLDS = [52, 68, 106, 140]
 _FLAT_THRESHOLDS  = [42, 63, 88]
+
+
+def _consensus_bedrooms(epc_list: list) -> int:
+    """Majority-vote bedroom count across all EPC records for a postcode.
+
+    More robust than picking one record because a UK postcode covers several
+    properties and individual records may have data-quality issues.
+    """
+    if not epc_list:
+        return 3
+    counts = [_infer_bedrooms(r) for r in epc_list]
+    return Counter(counts).most_common(1)[0][0]
 
 
 def _infer_bedrooms(epc: dict) -> int:
