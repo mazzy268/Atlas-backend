@@ -732,6 +732,40 @@ async def health():
     }
 
 
+@app.get("/debug/epc")
+async def debug_epc(postcode: str):
+    """Return raw EPC data for a postcode so we can see which fields are present."""
+    records = await _fetch_epc(postcode)
+    best = _best_epc(records)
+    inferred = _infer_bedrooms(best)
+    return {
+        "postcode": postcode,
+        "record_count": len(records),
+        "best_record_fields": {
+            "number-of-bedrooms": best.get("number-of-bedrooms"),
+            "number-habitable-rooms": best.get("number-habitable-rooms"),
+            "total-floor-area": best.get("total-floor-area"),
+            "property-type": best.get("property-type"),
+            "built-form": best.get("built-form"),
+            "lodgement-date": best.get("lodgement-date"),
+            "address1": best.get("address1"),
+            "address2": best.get("address2"),
+        },
+        "all_records_summary": [
+            {
+                "address": r.get("address1", "") + " " + r.get("address2", ""),
+                "number-of-bedrooms": r.get("number-of-bedrooms"),
+                "number-habitable-rooms": r.get("number-habitable-rooms"),
+                "total-floor-area": r.get("total-floor-area"),
+                "property-type": r.get("property-type"),
+                "lodgement-date": r.get("lodgement-date"),
+            }
+            for r in records
+        ],
+        "inferred_bedrooms": inferred,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA FETCHERS
 # ═══════════════════════════════════════════════════════════════════════════════
