@@ -58,44 +58,46 @@ EA_FLOOD   = "https://environment.data.gov.uk/flood-monitoring/id/floods"
 OVERPASS   = "https://overpass-api.de/api/interpreter"
 EPC_URL    = "https://epc.opendatacommunities.org/api/v1/domestic/search"
 
-# ── VOA 2024 median rents by region and bedroom count ────────────────────────
+# ── VOA 2025 median rents by region and bedroom count ────────────────────────
+# Source: VOA Private Rental Market Statistics, England 2023-24; ONS Scotland/Wales 2024
 VOA_RENTS = {
-    "london":                   {1: 1750, 2: 2300, 3: 2900, 4: 3800},
-    "south east":               {1: 1050, 2: 1350, 3: 1650, 4: 2100},
-    "east of england":          {1: 900,  2: 1150, 3: 1400, 4: 1800},
-    "south west":               {1: 850,  2: 1100, 3: 1350, 4: 1700},
-    "east midlands":            {1: 650,  2: 850,  3: 1000, 4: 1300},
-    "west midlands":            {1: 700,  2: 900,  3: 1050, 4: 1350},
-    "north west":               {1: 700,  2: 875,  3: 1050, 4: 1350},
-    "yorkshire and the humber": {1: 600,  2: 775,  3: 900,  4: 1150},
-    "north east":               {1: 525,  2: 650,  3: 775,  4: 975},
-    "wales":                    {1: 600,  2: 750,  3: 875,  4: 1100},
-    "scotland":                 {1: 800,  2: 1000, 3: 1200, 4: 1550},
-    "default":                  {1: 700,  2: 900,  3: 1100, 4: 1400},
+    "london":                   {1: 2000, 2: 2700, 3: 3300, 4: 4500},
+    "south east":               {1: 1200, 2: 1550, 3: 1900, 4: 2500},
+    "east of england":          {1: 1000, 2: 1250, 3: 1550, 4: 2000},
+    "south west":               {1: 950,  2: 1200, 3: 1450, 4: 1850},
+    "east midlands":            {1: 750,  2: 950,  3: 1100, 4: 1400},
+    "west midlands":            {1: 800,  2: 1000, 3: 1150, 4: 1500},
+    "north west":               {1: 775,  2: 975,  3: 1150, 4: 1450},
+    "yorkshire and the humber": {1: 695,  2: 850,  3: 1000, 4: 1300},
+    "north east":               {1: 600,  2: 795,  3: 900,  4: 1100},
+    "wales":                    {1: 700,  2: 875,  3: 1000, 4: 1250},
+    "scotland":                 {1: 900,  2: 1100, 3: 1350, 4: 1750},
+    "northern ireland":         {1: 650,  2: 850,  3: 1000, 4: 1300},
+    "default":                  {1: 800,  2: 1000, 3: 1200, 4: 1550},
 }
 
-# ── ONS HPI annual % growth by region ────────────────────────────────────────
+# ── ONS UK HPI annual % growth by region (November 2024 release) ─────────────
 ONS_GROWTH = {
-    "london": 2.1, "south east": 3.4, "east of england": 2.8,
-    "south west": 4.1, "east midlands": 4.8, "west midlands": 4.2,
-    "north west": 5.1, "yorkshire and the humber": 4.3,
-    "north east": 5.8, "wales": 3.9, "scotland": 4.4,
-    "northern ireland": 6.2, "default": 3.8,
+    "london": 3.2, "south east": 3.9, "east of england": 3.5,
+    "south west": 4.2, "east midlands": 5.3, "west midlands": 5.2,
+    "north west": 5.4, "yorkshire and the humber": 4.8,
+    "north east": 6.1, "wales": 4.5, "scotland": 5.6,
+    "northern ireland": 6.9, "default": 4.5,
 }
 
-# ── Typical gross yields by region (used as rent fallback) ───────────────────
+# ── Typical gross yields by region (BM Solutions/Rightmove 2024 survey) ──────
 REGIONAL_YIELDS = {
-    "london": 3.5, "south east": 4.0, "east of england": 4.2,
-    "south west": 4.5, "east midlands": 5.5, "west midlands": 5.2,
-    "north west": 5.8, "yorkshire and the humber": 5.5,
-    "north east": 6.5, "wales": 5.0, "scotland": 5.5,
-    "default": 5.0,
+    "london": 3.8, "south east": 4.2, "east of england": 4.5,
+    "south west": 4.8, "east midlands": 5.8, "west midlands": 5.5,
+    "north west": 6.2, "yorkshire and the humber": 5.8,
+    "north east": 7.0, "wales": 5.5, "scotland": 6.0,
+    "northern ireland": 6.5, "default": 5.5,
 }
 
 # ── Property type rent multipliers ───────────────────────────────────────────
 PROP_TYPE_MULTIPLIER = {
-    "detached": 1.12, "semi-detached": 1.02, "terraced": 0.97,
-    "flat": 0.93, "maisonette": 0.93, "bungalow": 0.90,
+    "detached": 1.15, "semi-detached": 1.04, "terraced": 0.97,
+    "flat": 0.92, "maisonette": 0.93, "bungalow": 0.91,
 }
 
 # ── App init ──────────────────────────────────────────────────────────────────
@@ -185,14 +187,26 @@ async def analyse_property(request: Request):
     lng    = coords["longitude"]
     region = coords.get("region", "").lower()
 
-    # Extract postcode for downstream APIs — prefer geocoder result, then regex from input
+    # Extract postcode — always preserve spaced format required by EPC/LR APIs
     _pc_match = re.search(r'[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}', input_location.upper())
-    rpc = coords.get("postcode") or (_pc_match.group(0).replace(" ", "") if _pc_match else input_location.upper()[:8])
+    if _pc_match:
+        _pc_raw = _pc_match.group(0).replace(" ", "")
+        _pc_spaced = (_pc_raw[:-3] + " " + _pc_raw[-3:]) if len(_pc_raw) >= 5 else _pc_raw
+    else:
+        _pc_spaced = ""
+    rpc = coords.get("postcode") or _pc_spaced or input_location.upper()[:8]
+
+    # Extract street address before the postcode for address-specific EPC lookup
+    _addr_hint = ""
+    if _pc_match:
+        _before_pc = input_location[:input_location.upper().find(_pc_match.group(0))].strip().strip(',').strip()
+        if _before_pc:
+            _addr_hint = _before_pc
 
     # Step 2: Fan out to all data sources concurrently
     fetched = await asyncio.gather(
         _fetch_sales(rpc),
-        _fetch_epc(rpc),
+        _fetch_epc(rpc, _addr_hint),
         _fetch_crime(lat, lng),
         _fetch_demographics(rpc),
         _fetch_flood(lat, lng),
@@ -216,8 +230,14 @@ async def analyse_property(request: Request):
     region = demo_d.get("region", region).lower() if demo_d.get("region") else region
 
     # Step 3: Derive all values
-    # Use majority vote across all EPC records — more robust than one record for a whole postcode
-    beds        = _consensus_bedrooms(epc_list) if epc_list else _infer_bedrooms(epc)
+    # If address-hint returned a targeted EPC (1 record = specific property), use it directly.
+    # Otherwise majority-vote across all records for the postcode.
+    if epc_list and _addr_hint and len(epc_list) <= 3:
+        beds = _infer_bedrooms(epc)          # targeted result — trust single record
+    elif epc_list:
+        beds = _consensus_bedrooms(epc_list) # postcode-level — use majority vote
+    else:
+        beds = 3                             # no EPC data — UK median default
     floor_area  = _f(epc.get("total-floor-area") or epc.get("floor_area_sqm"), 0.0)
     prop_type   = epc.get("property-type") or epc.get("property_type") or "Residential"
     epc_rating  = epc.get("current-energy-rating") or epc.get("current_energy_rating")
@@ -726,7 +746,7 @@ async def get_development(address: str, postcode: str):
 async def health():
     return {
         "status": "ok",
-        "version": "4.1.0",
+        "version": "4.2.0",
         "database": "none — stateless deployment",
         "hf_configured": bool(HF_API_KEY),
         "epc_configured": bool(EPC_API_KEY),
@@ -887,7 +907,7 @@ LIMIT {n}
     return merged[:limit]
 
 
-async def _fetch_epc(postcode: str) -> list:
+async def _fetch_epc(postcode: str, address_hint: str = "") -> list:
     if not EPC_API_KEY:
         return []
     try:
@@ -896,14 +916,34 @@ async def _fetch_epc(postcode: str) -> list:
         pc = postcode.strip().upper().replace(" ", "")
         pc_fmt = (pc[:-3] + " " + pc[-3:]) if len(pc) >= 5 else postcode.strip().upper()
         creds = base64.b64encode(f"{EPC_API_EMAIL}:{EPC_API_KEY}".encode()).decode()
+
+        params: dict = {"postcode": pc_fmt, "size": 25}
+
+        # When a specific address is provided, try a targeted lookup first
+        if address_hint:
+            num_m = re.match(r'^(\d+[A-Za-z]?)', address_hint.strip())
+            if num_m:
+                params["address"] = num_m.group(1)
+
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                EPC_URL,
-                params={"postcode": pc_fmt, "size": 25},
+                EPC_URL, params=params,
                 headers={"Accept": "application/json", "Authorization": f"Basic {creds}"},
             )
             if resp.status_code == 200:
-                return resp.json().get("rows", [])
+                rows = resp.json().get("rows", [])
+                # If address-targeted search returned results, use them
+                if rows:
+                    return rows
+                # Otherwise fall back to postcode-only (drop address filter)
+                if "address" in params:
+                    params.pop("address")
+                    resp2 = await client.get(
+                        EPC_URL, params=params,
+                        headers={"Accept": "application/json", "Authorization": f"Basic {creds}"},
+                    )
+                    if resp2.status_code == 200:
+                        return resp2.json().get("rows", [])
     except Exception:
         pass
     return []
@@ -1393,12 +1433,13 @@ async def _run_ai(postcode, value, rent, yield_pct, inv_score, strategy,
 
 def _calc_value(sales: list, region: str, floor_area: float, beds: int = 3,
                 prop_type: str = "", ukhpi_district_avg: int = 0) -> int:
-    # Regional price-per-sqm benchmarks (2024, £/sqm median)
+    # Regional price-per-sqm benchmarks (2025, £/sqm median, ONS/Zoopla)
     _PSM = {
-        "london": 7500, "south east": 4200, "east of england": 3400,
-        "south west": 3200, "east midlands": 2400, "west midlands": 2500,
-        "north west": 2300, "yorkshire and the humber": 2000,
-        "north east": 1800, "wales": 2000, "scotland": 2200, "default": 2600,
+        "london": 8000, "south east": 4500, "east of england": 3600,
+        "south west": 3300, "east midlands": 2500, "west midlands": 2600,
+        "north west": 2400, "yorkshire and the humber": 2100,
+        "north east": 1900, "wales": 2100, "scotland": 2300,
+        "northern ireland": 1950, "default": 2700,
     }
     psm = next((v for k, v in _PSM.items() if k != "default" and k in region), _PSM["default"])
 
