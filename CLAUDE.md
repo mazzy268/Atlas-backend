@@ -1,269 +1,166 @@
 # CLAUDE.md
 
-# Atlas Property Intelligence – Claude Context
-
-## Overview
-
-Atlas is a UK-based property intelligence SaaS platform designed for investors.
-
-The system takes a property address or postcode and returns a full investment analysis including:
-
-* investment score
-* deal analysis
-* rental yield
-* growth forecasts
-* risk analysis
-* development potential
-* AI-generated summary
-
-The frontend is built in Lovable.
-The backend is built with FastAPI and deployed on Railway.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ---
 
-## Core Architecture
+## Two coexisting apps — always know which one you're touching
 
-### Backend
+| File | DB | AI | Tests target it? |
+|------|----|----|-----------------|
+| `dashboard_main.py` | None (stateless) | HuggingFace `mistralai/Mistral-7B-Instruct-v0.2` | No |
+| `app/main.py` | PostgreSQL via SQLAlchemy + asyncpg | OpenAI | Yes |
 
-* Framework: FastAPI
-* Main file: dashboard_main.py
-* Deployment: Railway
-* API base URL: production Railway URL
-* Main endpoint: POST /analyse-property
-
-### Frontend
-
-* Built in Lovable
-* Uses a single API call
-* Expects ALL data from one endpoint
+**Production entry point is `dashboard_main.py`.** The `app/` directory is a modular alternative that requires Postgres and is what `tests/test_endpoints.py` imports. Changes to one do not affect the other.
 
 ---
 
-## CRITICAL RULES (DO NOT BREAK THESE)
-
-### 1. NO DATABASE
-
-* This system is stateless
-* DO NOT use:
-
-  * SQLAlchemy
-  * SessionLocal
-  * database connections
-* Any portfolio features must return mock responses:
-
-  * GET /portfolio → []
-  * POST /portfolio/add → {"status": "success"}
-
----
-
-### 2. SINGLE SOURCE OF TRUTH
-
-* ALL frontend widgets depend on ONE API call:
-  POST /analyse-property
-* DO NOT create multiple dependent endpoints for core data
-* Response must contain ALL required fields
-
----
-
-### 3. INPUT FORMAT
-
-The API must accept:
-
-{
-"address": "string"
-}
-
-OR
-
-{
-"postcode": "string"
-}
-
-Internally normalize:
-input_location = address or postcode
-
----
-
-### 4. AI SYSTEM
-
-* Use Hugging Face (NOT OpenAI, NOT Groq)
-* Model:
-  mistralai/Mistral-7B-Instruct-v0.2
-* API key from environment:
-  HUGGINGFACE_API_KEY
-
-Requirements:
-
-* Always return ai_summary
-* If AI fails → return fallback summary
-* NEVER crash API due to AI
-
----
-
-### 5. ERROR HANDLING
-
-* Wrap ALL external API calls in try/except
-* If any data source fails:
-
-  * return fallback/default values
-  * DO NOT crash
-
----
-
-### 6. RESPONSE STRUCTURE
-
-The /analyse-property endpoint MUST always return:
-
-* property (address, postcode, type, floor area)
-* scores (investment, deal, risk, liquidity)
-* financials (yield, rent, value, cashflow)
-* growth (1yr, 3yr, 5yr)
-* development (loft, extension, ROI)
-* neighbourhood (crime, schools, transport)
-* ai_summary
-
-No missing keys. No mock London data.
-
----
-
-### 7. FRONTEND COMPATIBILITY
-
-* Lovable uses a global PropertyContext
-* ALL widgets read from ONE response
-* Do NOT rename fields randomly
-* Do NOT change structure without mapping
-
----
-
-## CURRENT GOALS
-
-Claude must prioritise:
-
-1. Fix backend errors (no 500 errors)
-2. Ensure /analyse-property works reliably
-3. Ensure response is complete and consistent
-4. Ensure compatibility with Lovable frontend
-5. Remove ALL hardcoded/mock data
-6. Ensure ALL widgets can update dynamically
-
----
-
-## NON-GOALS (DO NOT DO)
-
-* Do NOT add authentication
-* Do NOT add payments
-* Do NOT add database
-* Do NOT restructure frontend
-* Do NOT introduce unnecessary complexity
-
----
-
-## SUCCESS DEFINITION
-
-The system is complete when:
-
-* API returns 200 consistently
-* No crashes on Railway
-* Lovable dashboard updates ALL widgets from ONE search
-* No mock data remains
-* AI summary works or gracefully falls back
-
----
-
-## INSTRUCTIONS FOR CLAUDE
-
-When modifying code:
-
-* Make minimal, precise changes
-* Do not break existing working features
-* Always explain what was changed
-* Always prioritise stability over new features
-
-If unsure:
-
-* default to simpler implementation
-* avoid adding dependencies
-
----
-
-End of file.
-
-This repo has two separate FastAPI apps that coexist:
-
-| File | DB | AI | Status |
-|------|----|----|--------|
-| `dashboard_main.py` | None (stateless) | HuggingFace Inference API (`mistralai/Mistral-7B-Instruct-v0.2`) | Production entry point |
-| `app/main.py` | PostgreSQL via SQLAlchemy + asyncpg | OpenAI | Modular/extensible version |
-
-**Default for deployment is `dashboard_main.py`** — it's zero-dependency (no DB), self-contained, and built for live UK government API calls. The `app/` directory is a more modular alternative that requires Postgres.
-
-## Running the app
+## Commands
 
 ```bash
-# Stateless version (no DB required)
+# Run production app (no DB)
 uvicorn dashboard_main:app --reload --port 8000
 
-# Modular version (requires Postgres)
+# Run modular app (requires Postgres)
 docker-compose up -d postgres
 uvicorn app.main:app --reload --port 8000
+
+# Tests (hit real external APIs — need internet)
+pytest tests/ -v
+pytest tests/test_endpoints.py::test_health -v   # single test
+
+# Full AI test (uses OpenAI credits)
+TEST_WITH_AI=1 pytest tests/ -v
+
+# Refresh static market data
+python scripts/daily_update.py
 ```
 
 Swagger UI: `http://localhost:8000/docs`
 
-## Running tests
-
-```bash
-pytest tests/ -v
-
-# Include full AI integration test (uses OpenAI credits, hits all live APIs)
-TEST_WITH_AI=1 pytest tests/ -v
-
-# Run a single test
-pytest tests/test_endpoints.py::test_health -v
-```
-
-Tests in `tests/test_endpoints.py` hit real external APIs — they require internet access.
+---
 
 ## Environment variables
 
 ```
-HUGGINGFACE_API_KEY   # dashboard_main.py AI (free, huggingface.co/settings/tokens)
-EPC_API_KEY           # EPC energy cert data (epc.opendatacommunities.org)
+HUGGINGFACE_API_KEY   # required for AI summary in dashboard_main.py
+EPC_API_KEY           # required for EPC data; without it, property details fall back to defaults
 EPC_API_EMAIL         # email registered with EPC API
-OPENAI_API_KEY        # app/ module AI (platform.openai.com)
-DATABASE_URL          # app/ module only (or use docker-compose postgres)
+OPENAI_API_KEY        # app/ module only
+DATABASE_URL          # app/ module only
 ```
 
-EPC is the only key that affects `dashboard_main.py` beyond AI — without it, EPC data returns empty and property details fall back to defaults.
+---
 
-## Architecture: `dashboard_main.py`
+## Architecture: `dashboard_main.py` (production)
 
-All logic lives in a single file. The main endpoint `POST /analyse-property` orchestrates the flow:
+All logic is in one ~3 000-line file. `POST /analyse-property` is the only endpoint Lovable calls.
 
-1. **Geocode** postcode via Nominatim → lat/lng + region
-2. **Fan out** via `asyncio.gather` to 6 data fetchers: `_fetch_sales`, `_fetch_epc`, `_fetch_crime`, `_fetch_demographics`, `_fetch_flood`, `_fetch_transport`
-3. **Calculate** scores and financials using pure functions (`_calc_value`, `_investment_score`, `_risk_score`, etc.)
-4. **AI summary** via `_run_ai` → `generate_ai_summary` → HuggingFace, with a rule-based `_hf_fallback` when the key is absent
-5. **Return** a large JSON response covering property, financials, scores, growth, risk, neighbourhood, comparables, deals, HMO, renovation, development
+**Request → response flow:**
 
-Static lookup tables (`VOA_RENTS`, `ONS_GROWTH`) contain hardcoded 2024 UK regional data — update these when refreshing market data.
+1. Parse body — accepts `{"address": "..."}` or `{"postcode": "..."}` (also tolerates bare strings and malformed JSON)
+2. `_geocode()` → Nominatim → lat/lng/region
+3. `asyncio.gather` fans out to 8 fetchers: `_fetch_sales`, `_fetch_epc`, `_fetch_crime`, `_fetch_demographics`, `_fetch_flood`, `_fetch_transport`, `_fetch_planning_data`, `_fetch_schools`
+4. `_fetch_ukhpi_data()` called sequentially after geocoding (needs district name from demographics)
+5. Pure calculation functions derive all scores and financials
+6. `_run_ai()` → HuggingFace with `_hf_fallback()` on failure
+7. Return one large JSON dict
 
-Portfolio is **in-memory only** (`portfolio_store: list[dict]`) — it resets on server restart.
+**Static lookup tables** (update these when refreshing market data):
+- `VOA_RENTS` — median monthly rents by region × bedroom count (VOA 2023-24)
+- `ONS_GROWTH` — annual HPI % by region (ONS November 2024)
+- `REGIONAL_YIELDS` — gross yield benchmarks by region
+- `PROP_TYPE_MULTIPLIER` — rent multiplier by property type
 
-## Architecture: `app/` module
+**Score functions** (all pure, deterministic):
+- `_investment_score`, `_risk_score`, `_liquidity_score`, `_deal_score_calc`, `_rental_demand_score`, `_street_score`
 
-Follows a layered structure: `api/endpoints/` → `services/ai_analysis/report_builder.py` → `services/data_fetchers/` → DB via `db/session.py`. Reports are cached in Postgres with a TTL; `force_refresh=True` bypasses the cache.
+**Bedroom inference:** majority-vote via `_consensus_bedrooms()` across all EPC records for postcode; `_infer_bedrooms()` for a single targeted EPC record. Falls back to `3` (UK median) if no EPC data.
 
-**To add a new data source to `app/`:**
-1. Create `app/services/data_fetchers/my_source.py` with `async def fetch(...) -> dict`
-2. Call it inside `gather_all_data()` in `app/services/ai_analysis/report_builder.py`
-3. Add a prompt in `app/services/ai_analysis/prompts.py`
+---
 
-## External APIs (all free, no key needed)
+## `/analyse-property` response structure
 
-- **Nominatim** (OpenStreetMap) — geocoding
-- **postcodes.io** — region, ward, IMD decile lookup
-- **HM Land Registry SPARQL** (`landregistry.data.gov.uk`) — price paid data
-- **data.police.uk** — street-level crime
-- **Environment Agency** (`environment.data.gov.uk`) — flood warnings
-- **Overpass API** — transport/stations via OSM tags
+Top-level keys in order:
+
+```
+postcode, display_address, latitude, longitude, generated_at
+property          — bedrooms, floor_area, type, EPC details, tenure, construction era
+financials        — value, rent, yield, cashflow, mortgage, deposit, SDLT, mortgage_scenarios
+scores            — investment, risk, liquidity, street, deal, rental_demand
+growth            — 1/3/5yr projections, annual_growth_rate_pct, is_projection: true
+market            — UKHPI district/type averages, trend, PSM
+ai_analysis       — best_strategy, all_strategies, key_positives, key_risks, summary
+renovation        — light/medium/heavy scenarios + EPC upgrade
+renovation_scenarios, best_scenario, renovation_summary
+development       — loft, extension, HMO viability and costs
+risk              — flood, crime, IMD, red_flags
+neighbourhood     — transport, schools, demographics, desirability
+planning          — Article 4, conservation area, listed building, HMO block
+comparables       — last 5 sales from Land Registry
+deals             — deal score, potential deals, best deal
+hmo_analysis      — room count, yield, cashflow vs BTL
+tax_analysis, brrrr_analysis, exit_analysis, ten_year_model
+confidence        — per-source confidence levels + overall score
+data_validation   — warnings, sanity flags
+data_freshness    — source dates per field
+data_age          — freshness label per source
+deal_breakdown, investor_decision, area_ranking, exit_strategy
+data_sources      — boolean flags for each live source + active_count
+disclaimer        — not_financial_advice: true, analysis_limitations[], confidence_explanation, regulatory_notice
+```
+
+**Do not rename or remove existing keys** — Lovable's PropertyContext reads all of them. Adding new keys is safe.
+
+---
+
+## Other endpoints in `dashboard_main.py`
+
+| Method | Path | Notes |
+|--------|------|-------|
+| `POST` | `/analyse-property` | Main — full analysis |
+| `POST` | `/compare-properties` | Returns field list for client-side comparison; does not call analyse internally |
+| `GET`  | `/market-heatmap` | Opportunity score for a location |
+| `GET`  | `/deal-scanner` | Deal score for a postcode |
+| `GET`  | `/risk-analysis` | Flood + crime risk only |
+| `GET`  | `/true-value` | Valuation with confidence range |
+| `GET`  | `/liquidity-score` | Time-to-sell estimate |
+| `GET`  | `/development-potential` | Loft/extension/HMO viability |
+| `GET`  | `/portfolio` | Returns `{"total": 0, "properties": []}` — in-memory stub |
+| `POST` | `/portfolio/add` | Returns `{"status": "success"}` — stub |
+| `DELETE` | `/portfolio/{id}` | Returns `{"status": "removed"}` — stub |
+
+Portfolio is permanently a stub. Do not add a database.
+
+---
+
+## Architecture: `app/` module (modular/DB-backed)
+
+Layered: `app/api/endpoints/` → `app/services/ai_analysis/report_builder.py` → `app/services/data_fetchers/` → `app/db/session.py`
+
+Reports are cached in Postgres with a TTL; pass `force_refresh=True` to bypass. To add a new data source: create `app/services/data_fetchers/my_source.py` with `async def fetch(...) -> dict`, call it in `gather_all_data()` in `report_builder.py`, add a prompt in `prompts.py`.
+
+Tests import from `app.main` — they will not test `dashboard_main.py` behaviour.
+
+---
+
+## Critical rules
+
+- **No database in `dashboard_main.py`** — no SQLAlchemy, no sessions, no connections
+- **Single endpoint** — all Lovable widgets depend on one call to `POST /analyse-property`
+- **AI must never crash the API** — always return a fallback summary
+- **All external calls wrapped in try/except** — return defaults, never propagate exceptions to 500
+- **Disclaimer block is required** — `disclaimer.not_financial_advice` must remain `true`; do not present projected values as facts
+- **Do not add**: authentication, payments, database, or new external dependencies
+
+---
+
+## External APIs (free, no key)
+
+- **Nominatim** — geocoding
+- **postcodes.io** — region/ward/IMD lookup
+- **HM Land Registry SPARQL** — price paid data
+- **data.police.uk** — crime
+- **Environment Agency** — flood warnings
+- **Overpass API** — transport/stations via OSM
+- **GOV.UK Planning Data API** — Article 4, conservation, listed buildings

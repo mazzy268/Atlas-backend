@@ -24,7 +24,7 @@ from datetime import date, datetime
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import logging
@@ -45,9 +45,10 @@ configure_logging()
 log = get_logger(__name__)
 
 # ── Environment config ────────────────────────────────────────────────────────
-HF_API_KEY    = os.getenv("HUGGINGFACE_API_KEY", "")
-EPC_API_KEY   = os.getenv("EPC_API_KEY", "")
-EPC_API_EMAIL = os.getenv("EPC_API_EMAIL", "")
+HF_API_KEY        = os.getenv("HUGGINGFACE_API_KEY", "")
+EPC_API_KEY       = os.getenv("EPC_API_KEY", "")
+EPC_API_EMAIL     = os.getenv("EPC_API_EMAIL", "")
+OS_PLACES_API_KEY = os.getenv("OS_PLACES_API_KEY", "")
 
 # ── External API URLs ─────────────────────────────────────────────────────────
 NOMINATIM  = "https://nominatim.openstreetmap.org/search"
@@ -56,7 +57,8 @@ HMLR       = "https://landregistry.data.gov.uk/landregistry/query"
 POLICE_URL = "https://data.police.uk/api/crimes-street/all-crime"
 EA_FLOOD   = "https://environment.data.gov.uk/flood-monitoring/id/floods"
 OVERPASS   = "https://overpass-api.de/api/interpreter"
-EPC_URL    = "https://epc.opendatacommunities.org/api/v1/domestic/search"
+EPC_URL      = "https://epc.opendatacommunities.org/api/v1/domestic/search"
+EPC_CERT_URL = "https://epc.opendatacommunities.org/api/v1/domestic/certificate"
 
 # ── VOA 2025 median rents by region and bedroom count ────────────────────────
 # Source: VOA Private Rental Market Statistics, England 2023-24; ONS Scotland/Wales 2024
@@ -107,7 +109,7 @@ from fastapi.responses import JSONResponse
 app = FastAPI(
     title="Atlas Property Intelligence",
     description="UK property analysis API — no database required",
-    version="4.0.0",
+    version="6.0.0",
     docs_url="/docs",
 )
 
@@ -131,6 +133,10 @@ async def global_exception_handler(request: Request, exc: Exception):
 class PropertyRequest(BaseModel):
     postcode: Optional[str] = None
     address: Optional[str] = None
+    uprn: Optional[str] = None
+    lmk_key: Optional[str] = None
+    force_refresh: bool = False
+    image: Optional[str] = None  # base64 or URL — future vision analysis hook
 
 class PortfolioAddRequest(BaseModel):
     postcode: Optional[str] = None
@@ -173,10 +179,31 @@ async def analyse_property(request: Request):
                     body = {"address": raw_text}
 
         input_location = (body.get("address") or body.get("postcode") or "").strip()
-        if not input_location:
-            raise HTTPException(status_code=422, detail="Provide 'address' or 'postcode'")
+        input_uprn     = (body.get("uprn") or "").strip()
+        input_lmk_key  = (body.get("lmk_key") or "").strip()
 
-        coords = await _geocode(input_location)
+        if not input_location and not input_uprn and not input_lmk_key:
+            raise HTTPException(status_code=422, detail="Provide 'address', 'postcode', 'uprn', or 'lmk_key'")
+
+        if input_lmk_key and not input_location and not input_uprn:
+            raise HTTPException(status_code=422, detail="Provide 'address' or 'postcode' alongside 'lmk_key' for geocoding")
+
+        # Broad postcode (district/sector only, e.g. "NE15") — cannot analyse a specific property
+        if input_location and _is_broad_postcode(input_location) and not input_uprn and not input_lmk_key:
+            return JSONResponse(status_code=200, content={
+                "requires_address_selection": True,
+                "analysis_status": {
+                    "exact_property_selected": False,
+                    "requires_address_selection": True,
+                    "data_quality": "low",
+                    "warnings": ["Please enter a full postcode or exact property address."],
+                },
+                "address_options": [],
+                "message": "Please enter a full postcode or exact property address.",
+            })
+
+        geocode_target = input_location or input_uprn
+        coords = await _geocode(geocode_target)
 
     except HTTPException:
         raise
@@ -194,19 +221,29 @@ async def analyse_property(request: Request):
         _pc_spaced = (_pc_raw[:-3] + " " + _pc_raw[-3:]) if len(_pc_raw) >= 5 else _pc_raw
     else:
         _pc_spaced = ""
-    rpc = coords.get("postcode") or _pc_spaced or input_location.upper()[:8]
+    # User-supplied postcode always wins over Nominatim's nearest-postcode guess
+    rpc = _pc_spaced or coords.get("postcode") or input_location.upper()[:8]
 
-    # Extract street address before the postcode for address-specific EPC lookup
+    # Extract street address — check both before and after the postcode
     _addr_hint = ""
     if _pc_match:
-        _before_pc = input_location[:input_location.upper().find(_pc_match.group(0))].strip().strip(',').strip()
-        if _before_pc:
-            _addr_hint = _before_pc
+        _pc_pos = input_location.upper().find(_pc_match.group(0))
+        _before_pc = input_location[:_pc_pos].strip().strip(',').strip()
+        _after_pc  = input_location[_pc_pos + len(_pc_match.group(0)):].strip().strip(',').strip()
+        _addr_hint = _before_pc or _after_pc
+
+    # Resolve exact UPRN via OS Places if we have a house number but no UPRN yet
+    if not input_uprn and _addr_hint and OS_PLACES_API_KEY:
+        _uprn_list = await _fetch_uprns_by_postcode(rpc)
+        if _uprn_list:
+            _resolved = _resolve_uprn_from_hint(_uprn_list, _addr_hint)
+            if _resolved:
+                input_uprn = _resolved
 
     # Step 2: Fan out to all data sources concurrently
     fetched = await asyncio.gather(
         _fetch_sales(rpc),
-        _fetch_epc(rpc, _addr_hint),
+        _fetch_epc(rpc, _addr_hint, uprn=input_uprn, lmk_key=input_lmk_key),
         _fetch_crime(lat, lng),
         _fetch_demographics(rpc),
         _fetch_flood(lat, lng),
@@ -225,6 +262,41 @@ async def analyse_property(request: Request):
     planning_d = _sr(fetched[6], {})
     schools_d  = _sr(fetched[7], [])
     epc        = _best_epc(epc_list)  # most recent certificate for this postcode
+    _epc_matched_by = epc.get("_matched_by", "none") if epc else "none"
+
+    # Determine how precisely we matched this property
+    if input_lmk_key or _epc_matched_by == "lmk_key":
+        _match_method        = "lmk_key"
+        _property_confidence = "high"
+    elif input_uprn:
+        _match_method        = "uprn"
+        _property_confidence = "high"
+    elif _addr_hint and epc_list and len(epc_list) <= 3:
+        _match_method        = "address_string"
+        _property_confidence = "medium"
+    elif epc_list:
+        _match_method        = "postcode"
+        _property_confidence = "low"
+    else:
+        _match_method        = "none"
+        _property_confidence = "low"
+
+    # Multiple EPC records with no specific selector — ask the user to pick a property
+    if len(epc_list) > 1 and not input_uprn and not input_lmk_key:
+        address_options = [_epc_row_to_address_option(row, rpc) for row in epc_list]
+        return JSONResponse(status_code=200, content={
+            "requires_address_selection": True,
+            "requires_selection": True,
+            "address_options": address_options,
+            "postcode": rpc,
+            "message": "Multiple properties found at this postcode — please select the exact property to analyse.",
+            "analysis_status": {
+                "exact_property_selected": False,
+                "requires_address_selection": True,
+                "data_quality": "low",
+                "warnings": ["Multiple properties found at this postcode — please select an exact property"],
+            },
+        })
 
     # Use postcodes.io region (proper name like "North East") over Nominatim's "England"
     region = demo_d.get("region", region).lower() if demo_d.get("region") else region
@@ -241,6 +313,17 @@ async def analyse_property(request: Request):
     floor_area  = _f(epc.get("total-floor-area") or epc.get("floor_area_sqm"), 0.0)
     prop_type   = epc.get("property-type") or epc.get("property_type") or "Residential"
     epc_rating  = epc.get("current-energy-rating") or epc.get("current_energy_rating")
+
+    # Display bedrooms only when EPC explicitly states them — never invent
+    _explicit_beds = epc.get("number-of-bedrooms") or epc.get("number_of_bedrooms") if epc else None
+    if _explicit_beds is not None:
+        try:
+            displayed_beds = int(float(str(_explicit_beds)))
+        except (ValueError, TypeError):
+            displayed_beds = None
+    else:
+        displayed_beds = None
+    displayed_baths = None  # EPC does not contain bathroom count
 
     # Resolve crime/transport first — needed for rent calculation
     crime_tot   = crime_d.get("total_crimes", 0)
@@ -308,12 +391,42 @@ async def analyse_property(request: Request):
     brrrr           = _brrrr_analysis(est_value, rent, region, floor_area)
     cgt             = _cgt_estimate(est_value, int(est_value / 1.25))
 
-    # Step 4: AI analysis
+    # Step 4: Renovation Intelligence Engine
+    reno_intel = _renovation_scenarios(
+        est_value, rent, g_yield, beds, floor_area, prop_type,
+        region, epc, mortgage, loft_ok, ext_ok, hmo_rooms, hmo_rent,
+        planning_d.get("hmo_pd_blocked", False),
+    )
+
+    # Step 5: AI analysis
     ai = await _run_ai(
         rpc, est_value, rent, g_yield, inv_sc,
         strategy, crime_tot, flood_lv, region, beds,
         trans_sc, epc_rating, floor_area, prop_type,
     )
+
+    # Step 6: Investor intelligence engines
+    deal_bd    = _deal_breakdown(est_value, g_yield, risk_sc, inv_sc, flood_lv,
+                                  crime_tot, sales, trans_sc, imd_decile, growth_r,
+                                  cashflow, ukhpi_d, region, beds, liq_sc)
+    inv_dec    = _investor_decision(est_value, g_yield, rent, inv_sc, risk_sc,
+                                    liq_sc, region, beds, floor_area, sales,
+                                    growth_r, cashflow, strategy)
+    area_rank  = _rank_nearby_postcodes(rpc, region, growth_r, trans_sc)
+    exit_strat = _exit_strategy_engine(est_value, growth_r, liq_sc, risk_sc,
+                                        g_yield, rent, beds, floor_area, strategy,
+                                        region, inv_sc, cashflow)
+    enh_conf   = _enhanced_confidence(sales, epc, demo_d, crime_tot,
+                                       ukhpi_d, flood_d, trans_d)
+    dq_panel   = _build_data_quality(
+                    epc, epc_list, sales, crime_tot, demo_d, flood_d, trans_d,
+                    planning_d, schools_d, ukhpi_price,
+                    _epc_matched_by, _property_confidence, enh_conf)
+    inv_verd   = _investor_verdict(
+                    g_yield, risk_sc, liq_sc, rd_sc, inv_sc,
+                    cashflow, rent, strategy, growth_r,
+                    _property_confidence, enh_conf, inv_dec, flood_lv)
+
     comps = [
         {
             "address": f"{s.get('address_paon','').strip()} {s.get('street','').strip()}".strip() or "Nearby property",
@@ -325,16 +438,45 @@ async def analyse_property(request: Request):
         for s in sales[:5]
     ]
 
+    # Build enhanced widgets with fallback hierarchy
+    _yield_comp = _yield_benchmark_widget(region, rent, est_value, sales, ukhpi_d)
+    _mkt_trends = _market_trends_widget(region, growth_r, ukhpi_d, sales, liq_sc)
+    _mkt_trends["district"] = demo_d.get("admin_district", "")
+    _school_rat = _school_rating_widget(schools_d)
+    _deal_scan  = _deal_scanner_widget(rpc, region, g_yield, est_value, rent, rd_sc, liq_sc, growth_r, sales)
+
+    # Append fallback benchmark sources to data quality panel
+    if _yield_comp["level_used"] != "postcode":
+        dq_panel["sources"].append({
+            "name": "Yield benchmark",
+            "status": "fallback",
+            "matched_by": _yield_comp["level_used"],
+            "freshness": "modelled",
+            "note": _yield_comp["reason"],
+        })
+    if _mkt_trends["level_used"] != "district":
+        dq_panel["sources"].append({
+            "name": "Market trends",
+            "status": "fallback",
+            "matched_by": _mkt_trends["level_used"],
+            "freshness": "modelled",
+            "note": _mkt_trends["reason"],
+        })
+
     return {
         "postcode": rpc,
-        "display_address": coords.get("display_name", input_location),
+        "display_address": (f"{_addr_hint.title()}, {rpc}" if _addr_hint else rpc),
         "latitude": lat,
         "longitude": lng,
         "generated_at": datetime.utcnow().isoformat(),
 
         "property": {
-            "bedrooms": beds,
-            "bathrooms": max(1, beds - 1),
+            "uprn": input_uprn or None,
+            "lmk_key": epc.get("lmk-key") or epc.get("lmk_key") or input_lmk_key or None,
+            "match_method": _match_method,
+            "exact_property_selected": _property_confidence == "high",
+            "bedrooms": displayed_beds,
+            "bathrooms": displayed_baths,
             "floor_area_sqm": floor_area,
             "property_type": prop_type,
             "built_form": built_form,
@@ -381,6 +523,7 @@ async def analyse_property(request: Request):
             "street_score": st_sc,
             "street_grade": _grade(st_sc),
             "deal_score": deal_sc,
+            "deal_verdict": _deal_label(deal_sc),
             "rental_demand_score": rd_sc,
             "demand_level": _demand_label(rd_sc),
         },
@@ -394,6 +537,8 @@ async def analyse_property(request: Request):
             "one_year_uplift": val_1yr - est_value,
             "five_year_uplift": val_5yr - est_value,
             "source": "ONS House Price Index regional data",
+            "is_projection": True,
+            "projection_note": "Projections apply a constant historical regional growth rate and do not account for market cycles, interest rate changes, or local supply shocks. Treat as illustrative only.",
         },
 
         "market": {
@@ -409,6 +554,7 @@ async def analyse_property(request: Request):
             "price_per_sqm": int(est_value / floor_area) if floor_area >= 30 else None,
             "district_avg_psm": int(ukhpi_d["district_avg"] / 90) if ukhpi_d.get("district_avg") else None,
             "comparable_count": len(sales),
+            "area_type": _area_type(region, trans_sc, crime_tot),
             "source": "UKHPI / Land Registry",
         },
 
@@ -425,12 +571,31 @@ async def analyse_property(request: Request):
 
         "renovation": {
             "current_value": est_value,
-            "light": {"cost": 20000, "arv": int(est_value * 1.08), "roi_pct": 8.0, "works": ["New kitchen", "New bathrooms", "Redecoration"]},
-            "medium": {"cost": 45000, "arv": int(est_value * 1.18), "roi_pct": 18.0, "works": ["Full refurb", "Rewire", "Insulation", "Double glazing"]},
-            "heavy":  {"cost": 85000, "arv": int(est_value * 1.32), "roi_pct": 32.0, "works": ["Full refurb", "Extension", "Loft conversion", "New heating"]},
+            "light":  {
+                "cost": reno_intel["renovation_scenarios"][1]["estimated_cost"],
+                "arv":  reno_intel["renovation_scenarios"][1]["new_property_value"],
+                "roi_pct": reno_intel["renovation_scenarios"][1]["roi_pct"],
+                "works": reno_intel["renovation_scenarios"][1]["works"],
+            },
+            "medium": {
+                "cost": reno_intel["renovation_scenarios"][2]["estimated_cost"],
+                "arv":  reno_intel["renovation_scenarios"][2]["new_property_value"],
+                "roi_pct": reno_intel["renovation_scenarios"][2]["roi_pct"],
+                "works": reno_intel["renovation_scenarios"][2]["works"],
+            },
+            "heavy": {
+                "cost": reno_intel["renovation_scenarios"][4]["estimated_cost"],
+                "arv":  reno_intel["renovation_scenarios"][4]["new_property_value"],
+                "roi_pct": reno_intel["renovation_scenarios"][4]["roi_pct"],
+                "works": reno_intel["renovation_scenarios"][4]["works"],
+            },
             "epc_upgrade_cost": 8000,
             "epc_upgrade_notes": "Loft insulation, cavity wall fill, and heating upgrade to reach EPC C",
         },
+
+        "renovation_scenarios": reno_intel["renovation_scenarios"],
+        "best_scenario":        reno_intel["best_scenario"],
+        "renovation_summary":   reno_intel["summary"],
 
         "development": {
             "score": dev_sc,
@@ -550,7 +715,7 @@ async def analyse_property(request: Request):
         "exit_analysis":  cgt,
         "ten_year_model": ten_yr,
 
-        "confidence": _confidence_score(sales, epc, demo_d, crime_tot),
+        "confidence": enh_conf["confidence"],
 
         "data_validation": {
             "warnings": _val_warnings,
@@ -567,9 +732,28 @@ async def analyse_property(request: Request):
             "last_updated": datetime.utcnow().isoformat(),
         },
 
+        "data_age": enh_conf["data_age"],
+
+        "data_quality": dq_panel,
+
+        "deal_breakdown":    deal_bd,
+        "investor_decision": inv_dec,
+        "investor_verdict":  inv_verd,
+        "area_ranking":      {
+            "nearby_areas": area_rank,
+            "source": "Derived from ONS regional data — no additional API calls",
+        },
+        "exit_strategy":     exit_strat,
+
         "data_sources": {
             "land_registry": len(sales) > 0,
             "epc": bool(epc),
+            "epc_details": {
+                "available": bool(epc),
+                "source": "EPC Open Data Communities API",
+                "matched_by": _epc_matched_by,
+                "last_updated": epc.get("inspection-date") or epc.get("lodgement-date") if epc else None,
+            },
             "crime": crime_tot > 0,
             "demographics": bool(demo_d),
             "flood": flood_lv != "Unknown",
@@ -581,6 +765,95 @@ async def analyse_property(request: Request):
             "active_count": sum([len(sales) > 0, bool(epc), crime_tot > 0, bool(demo_d),
                                   flood_lv != "Unknown", trans_sc > 0,
                                   planning_d.get("risk_level") is not None, len(schools_d) > 0]),
+        },
+
+        # ── Widget-guarantee keys — always present, never undefined ──────────────
+        "yield_comparison": _yield_comp,
+
+        "market_trends": _mkt_trends,
+
+        "school_rating": _school_rat,
+
+        "deal_scanner": _deal_scan,
+
+        "floorplan_analysis": {
+            "available": False,
+            "reason": "No floorplan uploaded for this property.",
+            "next_step": "Upload a clear floorplan image or PDF when vision parsing is enabled.",
+        },
+
+        "planning_data": {
+            "available": planning_d.get("risk_level") is not None,
+            "applications": [],
+            "article_4_risk": (
+                "high" if planning_d.get("article_4_active")
+                else "medium" if planning_d.get("conservation_area") or planning_d.get("listed_building")
+                else "low"
+            ),
+            "permitted_development_note": (
+                "Article 4 direction active — permitted development rights are removed for HMO conversions in this area. Full planning permission required."
+                if planning_d.get("article_4_active")
+                else "Conservation area restrictions apply — check with local planning authority before external alterations."
+                if planning_d.get("conservation_area")
+                else "Listed building — permitted development rights are significantly restricted. Contact local planning authority."
+                if planning_d.get("listed_building")
+                else "No Article 4 direction detected. Standard permitted development rights likely apply, subject to local policy."
+            ),
+            "risk_level": planning_d.get("risk_level", "unknown"),
+            "article_4_active": planning_d.get("article_4_active", False),
+            "conservation_area": planning_d.get("conservation_area", False),
+            "listed_building": planning_d.get("listed_building", False),
+            "hmo_pd_blocked": planning_d.get("hmo_pd_blocked", False),
+            "permitted_development_likely": planning_d.get("permitted_development_likely", True),
+            "source": "GOV.UK Planning Data API",
+            "reason": (
+                None if planning_d.get("risk_level") is not None
+                else "Planning data unavailable from GOV.UK Planning Data API for this location. Check with your local council's planning portal for Article 4 directions, conservation areas, and development constraints."
+            ),
+        },
+
+        "analysis_status": {
+            "exact_property_selected": _property_confidence == "high",
+            "match_method": _match_method,
+            "property_confidence": _property_confidence,
+            "requires_address_selection": False,
+            "data_quality": (
+                "high" if (len(sales) >= 5 and bool(epc)) else
+                "medium" if (len(sales) >= 2 or bool(epc)) else
+                "low"
+            ),
+            "warnings": (
+                (["No EPC data found — bedrooms and floor area are not confirmed"] if not epc_list else []) +
+                (["No Land Registry sales found — valuation based on regional averages only"] if not sales else []) +
+                (["Broad postcode used — property details may cover multiple properties"] if (epc_list and len(epc_list) > 5 and not _addr_hint and not input_uprn and not input_lmk_key) else [])
+            ),
+        },
+
+        "disclaimer": {
+            "not_financial_advice": True,
+            "analysis_limitations": [
+                "Estimated property value is a statistical model based on comparable sales data — not a RICS formal valuation.",
+                "Rental figures are derived from VOA regional median data and may not reflect the specific property's achievable rent.",
+                "Growth projections use historical ONS regional HPI data; past performance is not a reliable indicator of future results.",
+                "Cashflow and mortgage estimates use assumed interest rates and costs — actual figures will vary by lender and circumstances.",
+                "Crime and flood data are sourced from public APIs and may not reflect the most recent incidents or updated flood modelling.",
+                "EPC data is sourced from government certificates which may be outdated or absent for some properties.",
+                "AI-generated analysis is produced algorithmically and should not replace advice from a qualified financial or property professional.",
+                "HMO, renovation, and development ROI figures are indicative estimates based on regional averages — site-specific surveys are required.",
+                "Tax figures (SDLT, CGT, income tax) are calculated using published HMRC rates; always consult a tax adviser before transacting.",
+            ],
+            "confidence_explanation": (
+                f"This analysis draws on {enh_conf['confidence_levels'].get('overall_data_quality', 'partial')} data coverage. "
+                f"{'Land Registry comparable sales were found, supporting the valuation estimate.' if len(sales) > 0 else 'No recent Land Registry sales were found — the valuation is based on regional averages only.'} "
+                f"{'EPC data is available for this postcode.' if bool(epc) else 'No EPC record was found — property details (bedrooms, floor area) are estimated from regional defaults.'} "
+                "Scores (investment, risk, deal) are relative indicators within the Atlas model and are not absolute ratings. "
+                "Higher confidence requires more live data sources returning results."
+            ),
+            "regulatory_notice": (
+                "Atlas Property Intelligence is an information service, not a regulated financial adviser. "
+                "Property investment carries risk including potential loss of capital. "
+                "You should seek independent financial, legal, and surveying advice before making any investment decision."
+            ),
         },
     }
 
@@ -602,6 +875,55 @@ async def portfolio_list():
 @app.delete("/portfolio/{property_id}")
 async def portfolio_delete(property_id: int):
     return {"status": "removed", "total": 0}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEAL COMPARISON (structure — call /analyse-property per postcode then compare)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/compare-properties")
+async def compare_properties(request: Request):
+    """
+    Deal comparison scaffold. Pass up to 5 postcodes; call /analyse-property
+    for each, then use the comparison_fields list to build a side-by-side view.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="JSON body required")
+
+    postcodes = body.get("postcodes", [])
+    if not postcodes:
+        raise HTTPException(status_code=422, detail="Provide 'postcodes' list (1–5 items)")
+    if len(postcodes) > 5:
+        raise HTTPException(status_code=422, detail="Maximum 5 postcodes per comparison")
+
+    return {
+        "comparison_id":   datetime.utcnow().isoformat(),
+        "postcodes":       [p.upper().strip() for p in postcodes],
+        "instructions":    "Call POST /analyse-property for each postcode, then compare the fields below.",
+        "comparison_fields": [
+            "financials.estimated_value",
+            "financials.rental_yield",
+            "financials.monthly_cashflow",
+            "financials.net_yield",
+            "scores.investment_score",
+            "scores.risk_score",
+            "scores.deal_score",
+            "growth.annual_growth_rate_pct",
+            "growth.five_year_projection",
+            "investor_decision.recommended_offer_price",
+            "investor_decision.suggested_hold_period",
+            "deal_breakdown.why_it_works",
+            "deal_breakdown.why_it_fails",
+            "deal_breakdown.hidden_risks",
+            "exit_strategy.best_exit_strategy",
+            "exit_strategy.expected_exit_value",
+            "exit_strategy.exit_timeline",
+            "confidence.overall",
+        ],
+        "max_properties": 5,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -765,10 +1087,223 @@ async def get_development(address: str, postcode: str):
 async def health():
     return {
         "status": "ok",
-        "version": "5.0.0",
+        "version": "6.1.0",
         "database": "none — stateless deployment",
         "hf_configured": bool(HF_API_KEY),
         "epc_configured": bool(EPC_API_KEY),
+        "os_places_configured": bool(OS_PLACES_API_KEY),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADDRESS SEARCH  (req. 1)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _is_broad_postcode(query: str) -> bool:
+    """Return True when query is only a district (NE15) or sector (NE15 6) — not a full postcode."""
+    q = query.strip().upper().replace(" ", "")
+    # Full postcode e.g. NE156DL — 6 or 7 chars, ends digit+2letters
+    if re.match(r'^[A-Z]{1,2}\d{1,2}[A-Z]?\d[A-Z]{2}$', q):
+        return False
+    # Sector e.g. NE156 ends with single digit (no trailing letters)
+    if re.match(r'^[A-Z]{1,2}\d{1,2}[A-Z]?\d$', q):
+        return True
+    # District e.g. NE15 — letters+digits, no trailing digit
+    if re.match(r'^[A-Z]{1,2}\d{1,2}[A-Z]?$', q):
+        return True
+    return False
+
+
+async def _os_places_search(query: str) -> list:
+    """Search OS Places API; returns list of address dicts."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://api.os.uk/search/places/v1/find",
+                params={"query": query, "maxresults": 10, "key": OS_PLACES_API_KEY},
+                headers={"Accept": "application/json"},
+            )
+            if resp.status_code == 200:
+                results = resp.json().get("results", [])
+                out = []
+                for r in results:
+                    ga = r.get("GAZETTEER_ENTRY", {})
+                    pc = ga.get("POSTCODE_LOCATOR", "") or ga.get("POSTCODE", "")
+                    out.append({
+                        "display_address": ga.get("FULL_ADDRESS") or ga.get("ADDRESS", query),
+                        "postcode": pc,
+                        "uprn": str(ga.get("UPRN", "")) or None,
+                        "latitude": ga.get("LAT"),
+                        "longitude": ga.get("LNG"),
+                        "source": "os_places",
+                        "confidence": "high",
+                    })
+                return out
+    except Exception:
+        pass
+    return []
+
+
+async def _fetch_uprns_by_postcode(postcode: str) -> list:
+    """OS Places /postcode endpoint — returns every address+UPRN for a full postcode."""
+    if not OS_PLACES_API_KEY:
+        return []
+    try:
+        pc = postcode.strip().upper().replace(" ", "")
+        pc_fmt = (pc[:-3] + " " + pc[-3:]) if len(pc) >= 5 else pc
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                "https://api.os.uk/search/places/v1/postcode",
+                params={"postcode": pc_fmt, "dataset": "DPA", "maxresults": 100, "key": OS_PLACES_API_KEY},
+                headers={"Accept": "application/json"},
+            )
+            if resp.status_code == 200:
+                out = []
+                for r in resp.json().get("results", []):
+                    dpa = r.get("DPA", {})
+                    uprn = str(dpa.get("UPRN", ""))
+                    if uprn:
+                        out.append({
+                            "uprn": uprn,
+                            "address": dpa.get("ADDRESS", ""),
+                            "building_number": (dpa.get("BUILDING_NUMBER") or dpa.get("SUB_BUILDING_NAME") or "").strip(),
+                            "building_name": (dpa.get("BUILDING_NAME") or "").strip(),
+                        })
+                return out
+    except Exception:
+        pass
+    return []
+
+
+def _resolve_uprn_from_hint(uprn_list: list, hint: str) -> str:
+    """Match an address hint (e.g. '42' or 'Flat 2') against OS Places results to get a UPRN."""
+    if not uprn_list or not hint:
+        return ""
+    hint = hint.strip()
+    num_m = re.match(r'^(\d+[A-Za-z]?)', hint)
+    if num_m:
+        target = num_m.group(1).upper()
+        for entry in uprn_list:
+            if (entry.get("building_number") or "").upper() == target:
+                return entry["uprn"]
+    hint_upper = hint.upper()
+    for entry in uprn_list:
+        if hint_upper in (entry.get("address") or "").upper():
+            return entry["uprn"]
+    return ""
+
+
+def _epc_row_to_address_option(row: dict, postcode: str = "") -> dict:
+    """Convert a raw EPC API row to a standardised address option for the frontend."""
+    addr1 = row.get("address1") or ""
+    addr2 = row.get("address2") or ""
+    addr3 = row.get("address3") or ""
+    pc    = row.get("postcode") or postcode or ""
+    parts = [p for p in [addr1, addr2, addr3, pc] if p]
+    display = ", ".join(parts) if parts else pc or "Unknown address"
+    uprn = str(row.get("uprn") or "").strip() or None
+    return {
+        "display_address": display,
+        "address1": addr1 or None,
+        "address2": addr2 or None,
+        "address3": addr3 or None,
+        "postcode": pc,
+        "uprn": uprn,
+        "lmk_key": row.get("lmk-key") or row.get("lmk_key") or None,
+        "property_type": row.get("property-type") or row.get("property_type"),
+        "floor_area_sqm": _f(row.get("total-floor-area") or row.get("floor_area_sqm"), None),
+        "epc_rating": row.get("current-energy-rating") or row.get("current_energy_rating"),
+        "inspection_date": row.get("inspection-date") or row.get("inspection_date") or None,
+        "lodgement_date": row.get("lodgement-date") or row.get("lodgement_date") or None,
+        "source": "EPC",
+        "confidence": "high" if uprn else "medium",
+    }
+
+
+@app.get("/address-search")
+async def address_search(query: str = Query(..., description="Postcode, partial address, or full address")):
+    """Return selectable exact property options for an address query."""
+    q = query.strip()
+    if not q:
+        return {"query": q, "requires_selection": True, "results": [], "warning": "No query provided."}
+
+    # Broad postcode (district/area) — cannot identify a specific property
+    if _is_broad_postcode(q):
+        return {
+            "query": q,
+            "requires_selection": True,
+            "results": [],
+            "warning": "Please enter a full postcode or exact address.",
+        }
+
+    # Full UK postcode — use EPC as the primary address source
+    if re.match(r'^[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}$', q.strip().upper()):
+        epc_records = await _fetch_epc(q)
+        if epc_records:
+            options = [_epc_row_to_address_option(row, q.upper()) for row in epc_records]
+            return {
+                "query": q,
+                "requires_selection": len(options) > 1,
+                "address_options": options,
+                "results": options,  # backwards-compat alias
+                "source": "EPC",
+                "warning": None,
+            }
+
+    # Non-postcode or EPC returned nothing — try OS Places then Nominatim
+    results = []
+    if OS_PLACES_API_KEY:
+        results = await _os_places_search(q)
+
+    if not results:
+        try:
+            geo = await _geocode(q)
+            pc = geo.get("postcode") or q
+            results = [{
+                "display_address": geo.get("display_name", q),
+                "postcode": pc,
+                "uprn": None,
+                "latitude": geo.get("latitude"),
+                "longitude": geo.get("longitude"),
+                "source": "fallback",
+                "confidence": "low",
+            }]
+        except Exception:
+            results = []
+
+    return {
+        "query": q,
+        "requires_selection": len(results) != 1,
+        "address_options": results,
+        "results": results,  # backwards-compat alias
+        "warning": (None if results
+                    else "No results found. Please try a different address or full postcode."),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FLOORPLAN UPLOAD  (req. 7)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/analyse-floorplan")
+async def analyse_floorplan(file: UploadFile = File(...)):
+    """Accept a floorplan PDF/image. Room extraction is not yet enabled — returns a beta stub."""
+    _allowed = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+    if file.content_type and file.content_type not in _allowed:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type '{file.content_type}'. Send a JPEG, PNG, WEBP, or PDF.",
+        )
+    # Drain the upload so the client connection closes cleanly; discard bytes.
+    try:
+        await file.read()
+    except Exception:
+        pass
+    return {
+        "available": False,
+        "reason": "Floorplan uploaded, but advanced room extraction is not enabled yet.",
+        "next_step": "Upload clear floorplan image/PDF when vision parsing is enabled.",
+        "filename": file.filename,
     }
 
 
@@ -926,43 +1461,66 @@ LIMIT {n}
     return merged[:limit]
 
 
-async def _fetch_epc(postcode: str, address_hint: str = "") -> list:
+async def _fetch_epc(postcode: str, address_hint: str = "", uprn: str = "", lmk_key: str = "") -> list:
     if not EPC_API_KEY:
         return []
     try:
         import base64
-        # EPC API requires spaced format: "NE156DL" → "NE15 6DL"
-        pc = postcode.strip().upper().replace(" ", "")
-        pc_fmt = (pc[:-3] + " " + pc[-3:]) if len(pc) >= 5 else postcode.strip().upper()
         creds = base64.b64encode(f"{EPC_API_EMAIL}:{EPC_API_KEY}".encode()).decode()
-
-        params: dict = {"postcode": pc_fmt, "size": 25}
-
-        # When a specific address is provided, try a targeted lookup first
-        if address_hint:
-            num_m = re.match(r'^(\d+[A-Za-z]?)', address_hint.strip())
-            if num_m:
-                params["address"] = num_m.group(1)
+        headers = {"Accept": "application/json", "Authorization": f"Basic {creds}"}
 
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                EPC_URL, params=params,
-                headers={"Accept": "application/json", "Authorization": f"Basic {creds}"},
-            )
+            # 0. LMK-key lookup — exact certificate, highest precision
+            if lmk_key:
+                r = await client.get(f"{EPC_CERT_URL}/{lmk_key}", headers=headers)
+                if r.status_code == 200:
+                    data = r.json()
+                    rows = data.get("rows", [])
+                    if not rows and data.get("lmk-key"):
+                        rows = [data]
+                    if rows:
+                        for row in rows:
+                            row["_matched_by"] = "lmk_key"
+                        return rows
+
+            # 1. UPRN-first lookup — most precise, exact property match
+            if uprn:
+                r = await client.get(EPC_URL, params={"uprn": uprn, "size": 5}, headers=headers)
+                if r.status_code == 200:
+                    rows = r.json().get("rows", [])
+                    if rows:
+                        for row in rows:
+                            row["_matched_by"] = "uprn"
+                        return rows
+
+            # EPC API requires spaced format: "NE156DL" → "NE15 6DL"
+            pc = postcode.strip().upper().replace(" ", "")
+            pc_fmt = (pc[:-3] + " " + pc[-3:]) if len(pc) >= 5 else postcode.strip().upper()
+            params: dict = {"postcode": pc_fmt, "size": 25}
+
+            # 2. Address-targeted lookup — number extracted from hint
+            if address_hint:
+                num_m = re.match(r'^(\d+[A-Za-z]?)', address_hint.strip())
+                if num_m:
+                    params["address"] = num_m.group(1)
+
+            resp = await client.get(EPC_URL, params=params, headers=headers)
             if resp.status_code == 200:
                 rows = resp.json().get("rows", [])
-                # If address-targeted search returned results, use them
                 if rows:
+                    matched_by = "postcode+address" if "address" in params else "postcode"
+                    for row in rows:
+                        row["_matched_by"] = matched_by
                     return rows
-                # Otherwise fall back to postcode-only (drop address filter)
+                # Fall back to postcode-only if address filter returned nothing
                 if "address" in params:
                     params.pop("address")
-                    resp2 = await client.get(
-                        EPC_URL, params=params,
-                        headers={"Accept": "application/json", "Authorization": f"Basic {creds}"},
-                    )
+                    resp2 = await client.get(EPC_URL, params=params, headers=headers)
                     if resp2.status_code == 200:
-                        return resp2.json().get("rows", [])
+                        rows2 = resp2.json().get("rows", [])
+                        for row in rows2:
+                            row["_matched_by"] = "postcode"
+                        return rows2
     except Exception:
         pass
     return []
@@ -1880,6 +2438,23 @@ def _hmo_room_rent(region: str) -> int:
     return HMO_ROOM_RENTS["default"]
 
 
+# ── Regional build cost multipliers (BCIS 2024 tender price index) ────────────
+REGIONAL_BUILD_COST = {
+    "london": 1.40, "south east": 1.20, "east of england": 1.10,
+    "south west": 1.05, "east midlands": 0.95, "west midlands": 0.95,
+    "north west": 0.90, "yorkshire and the humber": 0.88,
+    "north east": 0.85, "wales": 0.88, "scotland": 0.92,
+    "default": 1.0,
+}
+
+
+def _build_cost_multiplier(region: str) -> float:
+    for key, v in REGIONAL_BUILD_COST.items():
+        if key != "default" and key in region:
+            return v
+    return REGIONAL_BUILD_COST["default"]
+
+
 def _mortgage_scenarios(value: int, monthly_rent: int, region: str) -> dict:
     """Return BTL mortgage cashflow for four deposit/rate combinations."""
     scenarios = {}
@@ -2013,6 +2588,305 @@ def _brrrr_analysis(value: int, rent: int, region: str, floor_area: float) -> di
     }
 
 
+def _renovation_scenarios(
+    est_value: int,
+    rent: int,
+    g_yield: float,
+    beds: int,
+    floor_area: float,
+    prop_type: str,
+    region: str,
+    epc: dict,
+    mortgage: int,
+    loft_ok: bool,
+    ext_ok: bool,
+    hmo_rooms: int,
+    hmo_rent: int,
+    planning_blocked_hmo: bool = False,
+) -> dict:
+    """
+    Renovation Intelligence Engine.
+    Five scenarios with full financial breakdown using BCIS cost benchmarks,
+    VOA rent tables and RICS capital uplift heuristics. No paid APIs required.
+    """
+    sqm = floor_area if floor_area >= 30 else 85.0
+    mult = _build_cost_multiplier(region)
+    is_flat = "flat" in prop_type.lower() or "maisonette" in prop_type.lower()
+    epc_rating = (epc.get("current-energy-rating") or epc.get("current_energy_rating") or "D").upper()
+
+    def _new_yield(new_value: int, new_rent_monthly: int) -> float:
+        return round(new_rent_monthly * 12 / new_value * 100, 2) if new_value else g_yield
+
+    def _roi(cost: int, val_uplift: int, rent_uplift_monthly: int) -> float:
+        if cost <= 0:
+            return 0.0
+        return round((val_uplift + rent_uplift_monthly * 12) / cost * 100, 1)
+
+    def _payback(cost: int, rent_uplift_monthly: int) -> Optional[int]:
+        return round(cost / rent_uplift_monthly) if rent_uplift_monthly > 0 else None
+
+    # ── 1. Baseline ────────────────────────────────────────────────────────────
+    baseline = {
+        "name": "baseline",
+        "label": "No Changes",
+        "description": "Hold as-is. Current yield and value with no additional investment.",
+        "estimated_cost": 0,
+        "new_property_value": est_value,
+        "new_rent": rent,
+        "value_increase": 0,
+        "rent_increase": 0,
+        "gross_yield_pct": g_yield,
+        "yield_change_pct": 0.0,
+        "roi_pct": 0.0,
+        "payback_months": None,
+        "works": [],
+        "feasibility": "N/A",
+        "recommended_for": "Low-risk hold strategy",
+    }
+
+    # ── 2. Light refurbishment ─────────────────────────────────────────────────
+    # ~£350/sqm (capped at 100sqm) + regional multiplier
+    light_cost = max(12_000, int(min(sqm, 100) * 350 * mult))
+    # Poor EPC means more cosmetic gains when refreshed
+    light_uplift_pct = 0.07 if epc_rating in ("E", "F", "G") else 0.05
+    light_new_val = int(est_value * (1 + light_uplift_pct))
+    light_rent_inc = int(rent * 0.06)
+    light_new_rent = rent + light_rent_inc
+
+    light = {
+        "name": "light_refurb",
+        "label": "Light Refurbishment",
+        "description": "Cosmetic refresh to achieve top-of-market rent and improve saleability.",
+        "estimated_cost": light_cost,
+        "new_property_value": light_new_val,
+        "new_rent": light_new_rent,
+        "value_increase": light_new_val - est_value,
+        "rent_increase": light_rent_inc,
+        "gross_yield_pct": _new_yield(light_new_val, light_new_rent),
+        "yield_change_pct": round(_new_yield(light_new_val, light_new_rent) - g_yield, 2),
+        "roi_pct": _roi(light_cost, light_new_val - est_value, light_rent_inc),
+        "payback_months": _payback(light_cost, light_rent_inc),
+        "works": ["Budget kitchen refresh", "Bathroom refresh", "Full redecoration", "New flooring", "LED lighting upgrade"],
+        "feasibility": "High",
+        "recommended_for": "BTL landlords maximising rental income quickly",
+    }
+
+    # ── 3. Full refurbishment ──────────────────────────────────────────────────
+    # ~£850/sqm full strip-out + regional multiplier
+    full_cost = max(35_000, int(sqm * 850 * mult))
+    full_uplift_pct = 0.22 if epc_rating in ("E", "F", "G") else 0.17
+    full_new_val = int(est_value * (1 + full_uplift_pct))
+    full_rent_inc = int(rent * 0.15)
+    full_new_rent = rent + full_rent_inc
+
+    full = {
+        "name": "full_refurb",
+        "label": "Full Refurbishment",
+        "description": "Complete internal rebuild to substantially raise EPC rating, value and rent.",
+        "estimated_cost": full_cost,
+        "new_property_value": full_new_val,
+        "new_rent": full_new_rent,
+        "value_increase": full_new_val - est_value,
+        "rent_increase": full_rent_inc,
+        "gross_yield_pct": _new_yield(full_new_val, full_new_rent),
+        "yield_change_pct": round(_new_yield(full_new_val, full_new_rent) - g_yield, 2),
+        "roi_pct": _roi(full_cost, full_new_val - est_value, full_rent_inc),
+        "payback_months": _payback(full_cost, full_rent_inc),
+        "works": [
+            "Full kitchen & bathroom replacement", "Complete rewire (18th edition)",
+            "Boiler or heat pump replacement", "Cavity wall & loft insulation",
+            "Double glazing (if absent)", "Structural repairs", "Full redecoration",
+        ],
+        "feasibility": "Medium",
+        "recommended_for": "BRRRR investors — buy below market, refurb, refinance",
+    }
+
+    # ── 4. HMO conversion ─────────────────────────────────────────────────────
+    hmo_viable = hmo_rooms > 0 and not planning_blocked_hmo
+    hmo_conv_cost = int(hmo_rooms * 5_000 * mult) if hmo_rooms > 0 else 0
+    hmo_val_uplift = int(hmo_conv_cost * 1.3) if hmo_viable else 0
+    hmo_new_val = est_value + hmo_val_uplift
+    hmo_rent_inc = max(0, hmo_rent - rent) if hmo_viable else 0
+    hmo_new_rent_out = hmo_rent if hmo_viable else rent
+
+    hmo_scenario = {
+        "name": "hmo_conversion",
+        "label": "HMO Conversion",
+        "description": (
+            f"Convert to {hmo_rooms}-room HMO for significantly higher rental yield."
+            if hmo_viable else
+            "Property size or Article 4 planning restrictions limit HMO viability."
+        ),
+        "estimated_cost": hmo_conv_cost,
+        "new_property_value": hmo_new_val,
+        "new_rent": hmo_new_rent_out,
+        "value_increase": hmo_val_uplift,
+        "rent_increase": hmo_rent_inc,
+        "gross_yield_pct": _new_yield(hmo_new_val, hmo_new_rent_out),
+        "yield_change_pct": round(_new_yield(hmo_new_val, hmo_new_rent_out) - g_yield, 2),
+        "roi_pct": _roi(hmo_conv_cost, hmo_val_uplift, hmo_rent_inc) if hmo_conv_cost else 0.0,
+        "payback_months": _payback(hmo_conv_cost, hmo_rent_inc) if hmo_conv_cost else None,
+        "works": (
+            [
+                f"Fire doors to all {hmo_rooms} letting rooms",
+                "Grade D fire alarm & emergency lighting",
+                "Shared kitchen & bathroom upgrade",
+                "HMO licence application (mandatory 5+ occupants)",
+                "Article 4 / permitted development check",
+            ] if hmo_viable else ["Not viable — property too small or blocked by Article 4 direction"]
+        ),
+        "feasibility": "High" if hmo_viable and beds >= 5 else "Medium" if hmo_viable else "Low",
+        "recommended_for": "Yield-maximising investors in high-demand cities",
+        "hmo_rooms": hmo_rooms,
+        "article_4_blocked": planning_blocked_hmo,
+    }
+
+    # ── 5. Extension / Loft conversion ────────────────────────────────────────
+    ext_cost = int(((45_000 if ext_ok else 0) + (38_000 if loft_ok else 0)) * mult)
+    ext_sqm_add = (20 if ext_ok else 0) + (25 if loft_ok else 0)
+    # Local value-per-sqm drives capital uplift; cap at £5k/sqm to avoid outliers
+    local_psm = min(est_value / sqm, 5_000) if sqm > 0 else 3_000
+    ext_val_inc = int(ext_sqm_add * local_psm) if ext_cost > 0 else 0
+    ext_new_val = est_value + ext_val_inc
+    ext_new_beds = beds + (1 if ext_ok else 0) + (1 if loft_ok else 0)
+    # Rent uplift from extra bedroom via VOA table
+    if ext_new_beds > beds and ext_cost > 0:
+        voa_new = VOA_RENTS.get("default", {}).get(min(ext_new_beds, 4), rent)
+        for k in VOA_RENTS:
+            if k != "default" and k in region:
+                voa_new = VOA_RENTS[k].get(min(ext_new_beds, 4), rent)
+                break
+        ext_rent_inc = max(0, voa_new - rent)
+    else:
+        ext_rent_inc = 0
+    ext_new_rent = rent + ext_rent_inc
+    ext_works = []
+    if ext_ok:
+        ext_works += ["Single-storey rear extension", "Structural engineer & architect fees", "Planning permission application"]
+    if loft_ok:
+        ext_works += ["Loft conversion (dormer or Velux)", "New staircase & bedroom fit-out", "Building regs sign-off"]
+    if not ext_works:
+        ext_works = ["Extension and loft conversion not viable for this property type"]
+
+    ext_scenario = {
+        "name": "extension_potential",
+        "label": "Extension / Loft Conversion",
+        "description": (
+            f"Add ~{ext_sqm_add}sqm of floor area to create new bedroom(s) and maximise capital value."
+            if ext_cost > 0 else
+            "Structural development not viable for this property configuration."
+        ),
+        "estimated_cost": ext_cost,
+        "new_property_value": ext_new_val,
+        "new_rent": ext_new_rent,
+        "value_increase": ext_val_inc,
+        "rent_increase": ext_rent_inc,
+        "gross_yield_pct": _new_yield(ext_new_val, ext_new_rent),
+        "yield_change_pct": round(_new_yield(ext_new_val, ext_new_rent) - g_yield, 2),
+        "roi_pct": _roi(ext_cost, ext_val_inc, ext_rent_inc) if ext_cost else 0.0,
+        "payback_months": _payback(ext_cost, ext_rent_inc) if ext_cost else None,
+        "works": ext_works,
+        "feasibility": "High" if ext_ok and loft_ok else "Medium" if (ext_ok or loft_ok) else "Low",
+        "recommended_for": "Long-term capital growth investors",
+        "bedrooms_after": ext_new_beds,
+        "sqm_added": ext_sqm_add,
+    }
+
+    # ── Best scenario detection ────────────────────────────────────────────────
+    candidates = [light, full, hmo_scenario, ext_scenario]
+    feasible = [s for s in candidates if s["feasibility"] in ("High", "Medium") and s["estimated_cost"] > 0]
+
+    def _score(s: dict) -> float:
+        # Weighted: ROI 50%, yield delta 35%, feasibility 15%
+        roi_s   = min(s["roi_pct"] / 60.0, 1.0) * 50
+        yield_s = min(max(s["yield_change_pct"], 0) / 3.0, 1.0) * 35
+        feas_s  = 15 if s["feasibility"] == "High" else 7
+        return roi_s + yield_s + feas_s
+
+    if feasible:
+        best = max(feasible, key=_score)
+    else:
+        best = baseline
+
+    best_scenario = {
+        "name": best["name"],
+        "label": best["label"],
+        "reasoning": _reno_reasoning(best, est_value, rent, g_yield),
+        "estimated_cost": best["estimated_cost"],
+        "expected_roi_pct": best["roi_pct"],
+        "value_uplift": best["value_increase"],
+        "rent_uplift": best["rent_increase"],
+        "new_yield_pct": best["gross_yield_pct"],
+        "payback_months": best["payback_months"],
+        "investor_action": _investor_action(best["name"]),
+    }
+
+    # ── Value delta summary ────────────────────────────────────────────────────
+    max_val_inc  = max(s["value_increase"] for s in candidates)
+    max_rent_inc = max(s["rent_increase"] for s in candidates)
+    best_yield   = max(s["gross_yield_pct"] for s in candidates)
+
+    summary = {
+        "current_value":            est_value,
+        "current_rent":             rent,
+        "current_yield_pct":        g_yield,
+        "max_achievable_value":     est_value + max_val_inc,
+        "max_achievable_rent":      rent + max_rent_inc,
+        "max_achievable_yield_pct": best_yield,
+        "value_delta":              max_val_inc,
+        "rent_delta":               max_rent_inc,
+        "yield_delta_pct":          round(best_yield - g_yield, 2),
+        "scenarios_evaluated":      len(candidates),
+        "best_option":              best["name"],
+    }
+
+    return {
+        "renovation_scenarios": [baseline, light, full, hmo_scenario, ext_scenario],
+        "best_scenario": best_scenario,
+        "summary": summary,
+    }
+
+
+def _reno_reasoning(scenario: dict, est_value: int, rent: int, g_yield: float) -> str:
+    name     = scenario["name"]
+    cost     = scenario["estimated_cost"]
+    roi      = scenario["roi_pct"]
+    val_inc  = scenario["value_increase"]
+    rent_inc = scenario["rent_increase"]
+    if name == "light_refurb":
+        return (
+            f"Fastest payback at £{cost:,} with ~{roi:.0f}% total return. "
+            f"Achieves top-of-market rent (+£{rent_inc}/mo) with 3–6 week programme."
+        )
+    if name == "full_refurb":
+        return (
+            f"Strongest value uplift (+£{val_inc:,}) on £{cost:,} spend. "
+            f"Raises EPC rating and unlocks BRRRR refinance at 75% LTV."
+        )
+    if name == "hmo_conversion":
+        return (
+            f"Maximum yield play: +£{rent_inc}/mo rent on £{cost:,} conversion. "
+            f"~{roi:.0f}% ROI — best for high-demand urban locations."
+        )
+    if name == "extension_potential":
+        return (
+            f"Adds bedrooms and floor area, lifting value by £{val_inc:,}. "
+            f"{roi:.0f}% ROI on £{cost:,} — ideal long-term hold strategy."
+        )
+    return "No renovation materially improves returns. Hold as-is."
+
+
+def _investor_action(best_name: str) -> str:
+    actions = {
+        "baseline":             "Hold and monitor. No renovation required to hit target returns.",
+        "light_refurb":        "Proceed immediately. 3–6 week programme — get 3 quotes this week.",
+        "full_refurb":         "Plan 8–12 week programme. Target BRRRR refinance post-completion.",
+        "hmo_conversion":      "Check HMO licence requirements with local council before committing.",
+        "extension_potential": "Commission architect drawings. Allow 8–12 weeks for planning approval.",
+    }
+    return actions.get(best_name, "Consult a specialist before committing capital.")
+
+
 def _haversine(lat1, lon1, lat2, lon2) -> int:
     R = 6371000
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -2062,6 +2936,19 @@ def _deal_recommendation(score, sales):
     if score >= 50:
         return "Some deal activity. Negotiate 8-12% below asking price."
     return "Fair market — limited discounting. Target auctions or motivated sellers."
+
+def _area_type(region: str, trans_sc: int, crime_tot: int) -> str:
+    urban_keywords = ["london", "manchester", "birmingham", "leeds", "liverpool",
+                      "bristol", "sheffield", "edinburgh", "glasgow", "newcastle",
+                      "nottingham", "leicester", "coventry", "bradford", "cardiff"]
+    suburban_keywords = ["surrey", "kent", "essex", "hertfordshire", "oxfordshire",
+                         "cambridgeshire", "buckinghamshire", "berkshire", "cheshire"]
+    if any(k in region for k in urban_keywords):
+        return "Urban"
+    if any(k in region for k in suburban_keywords) or trans_sc >= 6:
+        return "Suburban"
+    return "Rural"
+
 
 def _desirability(inv, crime, transport):
     score = inv * 0.5 + crime * 5 + transport * 3
@@ -2196,3 +3083,953 @@ def _i(val, default=0) -> int:
 def _f(val, default=0.0) -> float:
     try: return float(val) if val is not None else default
     except: return default
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INVESTOR INTELLIGENCE ENGINES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _deal_breakdown(
+    est_value: int, g_yield: float, risk_sc: int, inv_sc: int, flood_lv: str,
+    crime_tot: int, sales: list, trans_sc: int, imd_decile: int, growth_r: float,
+    cashflow: int, ukhpi_d: dict, region: str, beds: int, liq_sc: int,
+) -> dict:
+    why_works, why_fails, hidden_risks = [], [], []
+    trend_pct = ukhpi_d.get("trend_pct_6m", 0) or 0
+
+    # Positive signals
+    if g_yield >= 7:
+        why_works.append(f"Exceptional gross yield of {g_yield:.1f}% — well above UK average")
+    elif g_yield >= 5.5:
+        why_works.append(f"Strong gross yield of {g_yield:.1f}% — above national average")
+    elif g_yield >= 4:
+        why_works.append(f"Yield of {g_yield:.1f}% covers mortgage at typical BTL rates")
+    if cashflow > 200:
+        why_works.append(f"Positive monthly cashflow of £{cashflow:,} after mortgage and costs")
+    if growth_r >= 5:
+        why_works.append(f"High-growth region — {growth_r:.1f}% annual ONS growth rate")
+    if trans_sc >= 7:
+        why_works.append("Excellent transport links — underpins strong tenant demand")
+    elif trans_sc >= 5:
+        why_works.append("Good transport connectivity supports rental demand")
+    if liq_sc >= 70:
+        why_works.append("Highly liquid market — clean exit available when needed")
+    if trend_pct > 2:
+        why_works.append(f"Local prices rising {trend_pct:.1f}% over the past 6 months")
+    if imd_decile and imd_decile >= 7:
+        why_works.append("Affluent area — lower void risk and better tenant quality")
+    if crime_tot < 30:
+        why_works.append("Very low crime — supports premium rents and minimal void periods")
+
+    # Negative signals
+    if g_yield < 4:
+        why_fails.append(f"Low yield of {g_yield:.1f}% — cashflow likely negative at standard BTL rates")
+    if cashflow < 0:
+        why_fails.append(f"Negative cashflow of £{abs(cashflow):,}/mo — requires income top-up")
+    elif cashflow < 100:
+        why_fails.append("Thin cashflow margin — any rate rise or void makes deal loss-making")
+    if flood_lv == "High":
+        why_fails.append("Flood Zone 3 — elevated insurance costs; some mortgage lenders will decline")
+    elif flood_lv == "Medium":
+        why_fails.append("Flood Zone 2 — some insurers add flood premium")
+    if crime_tot > 150:
+        why_fails.append(f"{crime_tot} crimes nearby — above average; voids and arrears more likely")
+    if liq_sc < 35:
+        why_fails.append("Illiquid market — may take 6+ months to exit if needed")
+    if trend_pct < -1:
+        why_fails.append(f"Local prices falling {abs(trend_pct):.1f}% over past 6 months")
+    if imd_decile and imd_decile <= 2:
+        why_fails.append("Highly deprived area — elevated tenant arrears and void risk")
+    if not sales:
+        why_fails.append("No comparable sales data — estimated value has low confidence")
+
+    # Hidden risks (non-obvious)
+    if g_yield >= 10:
+        hidden_risks.append("Yield above 10% often signals undisclosed issues — order a full structural survey")
+    if beds >= 4 and g_yield >= 7:
+        hidden_risks.append("High yield may reflect HMO-only demand; single-let rent will be materially lower")
+    if trend_pct > 5:
+        hidden_risks.append("Rapid recent price growth may be unsustainable — risk of buying at a cyclical peak")
+    if imd_decile and imd_decile <= 3:
+        hidden_risks.append("Section 24 impact amplified where rents are thin relative to mortgage interest")
+    if any(k in region for k in ["london", "south east"]):
+        hidden_risks.append("High entry price compresses yield — any rate rise significantly erodes cashflow")
+    if not hidden_risks:
+        hidden_risks.append("No atypical hidden risks detected — conduct standard due diligence (survey, LA search)")
+
+    return {
+        "why_it_works": why_works[:5],
+        "why_it_fails": why_fails[:5],
+        "hidden_risks":  hidden_risks[:3],
+    }
+
+
+def _investor_decision(
+    est_value: int, g_yield: float, rent: int, inv_sc: int, risk_sc: int,
+    liq_sc: int, region: str, beds: int, floor_area: float, sales: list,
+    growth_r: float, cashflow: int, strategy: str,
+) -> dict:
+    # Offer discount — driven by yield attractiveness
+    if g_yield < 4:
+        discount = 0.88   # 12% below estimate
+    elif g_yield < 5.5:
+        discount = 0.92   # 8% below
+    elif g_yield >= 7:
+        discount = 0.97   # 3% — already priced well
+    else:
+        discount = 0.94   # 6% below
+
+    recommended_offer = int(est_value * discount)
+    offer_yield = round(rent * 12 / recommended_offer * 100, 1) if recommended_offer else 0
+    discount_pct = round((1 - discount) * 100, 1)
+
+    # Hold period recommendation
+    if strategy == "Flip":
+        hold = "6–12 months"
+        hold_note = "Short-term capital gain or light renovation uplift"
+    elif strategy == "BRRRR":
+        hold = "12–18 months"
+        hold_note = "Refurb, refinance at 75% LTV, redeploy capital into next deal"
+    elif strategy == "SA":
+        hold = "2–5 years"
+        hold_note = "Serviced accommodation requires active management — medium term is optimal"
+    elif g_yield >= 6.5 and cashflow > 200:
+        hold = "10+ years"
+        hold_note = "High yield + strong cashflow — long hold maximises total return and compounding"
+    elif growth_r >= 5:
+        hold = "5–7 years"
+        hold_note = "Growth market — hold to capture appreciation across the price cycle"
+    else:
+        hold = "5–10 years"
+        hold_note = "Standard BTL period — absorbs acquisition costs and delivers compound growth"
+
+    # Reasoning narrative
+    parts = [
+        f"At £{recommended_offer:,} ({discount_pct}% below estimate), gross yield rises to {offer_yield:.1f}%.",
+    ]
+    if cashflow > 0:
+        parts.append(f"Monthly cashflow of £{cashflow:,} makes the deal self-funding from day one.")
+    else:
+        parts.append(f"Cashflow negative at £{abs(cashflow):,}/mo — negotiate price down or plan a shorter hold.")
+    if risk_sc >= 65:
+        parts.append("High risk profile — a lower entry price or shorter hold reduces downside exposure.")
+    elif risk_sc < 35:
+        parts.append("Low risk profile — supports confidence in the recommended hold period.")
+
+    # Price thresholds
+    target_6pct  = int(rent * 12 / 0.06) if rent else 0   # price at which yield = 6%
+    walk_away    = int(rent * 12 / 0.05) if rent else 0    # floor: below 5% yield, walk
+
+    return {
+        "recommended_offer_price":   recommended_offer,
+        "offer_discount_pct":        discount_pct,
+        "suggested_strategy":        strategy,
+        "suggested_hold_period":     hold,
+        "hold_rationale":            hold_note,
+        "reasoning":                 " ".join(parts),
+        "investor_type":             ("yield_investor" if g_yield >= 6
+                                      else "growth_investor" if growth_r >= 5
+                                      else "balanced"),
+        "max_price_for_6pct_yield":  target_6pct,
+        "walk_away_price":           walk_away,
+    }
+
+
+def _investor_verdict(
+    g_yield: float, risk_sc: int, liq_sc: int, rd_sc: int, inv_sc: int,
+    cashflow: int, rent: int, strategy: str, growth_r: float,
+    property_confidence: str, enh_conf: dict, inv_dec: dict,
+    flood_lv: str,
+) -> dict:
+    conf_label = enh_conf["confidence"]["overall"]["label"]   # "High" | "Medium" | "Low"
+
+    identity_ok = property_confidence in ("high", "medium")
+
+    is_avoid = (
+        inv_sc < 35
+        or risk_sc >= 70
+        or g_yield < 3.0
+        or (property_confidence == "low" and inv_sc < 45)
+    )
+    is_buy = (
+        not is_avoid
+        and identity_ok
+        and inv_sc >= 60
+        and risk_sc < 55
+        and g_yield >= 5.0
+        and conf_label != "Low"
+    )
+
+    if is_avoid:
+        verdict = "AVOID"
+    elif is_buy:
+        verdict = "BUY"
+    else:
+        verdict = "CONDITIONAL"
+
+    max_offer  = inv_dec.get("recommended_offer_price") if rent else None
+    walk_away  = inv_dec.get("walk_away_price")         if rent else None
+
+    if verdict == "BUY":
+        summary = (f"Strong buy at £{max_offer:,} — {g_yield:.1f}% yield with manageable risk."
+                   if max_offer else f"Strong buy — {g_yield:.1f}% yield with manageable risk.")
+    elif verdict == "AVOID":
+        if g_yield < 3.0:
+            summary = f"Avoid — {g_yield:.1f}% yield is below the minimum investment threshold."
+        elif risk_sc >= 70:
+            summary = f"Avoid — risk score of {risk_sc} signals significant downside exposure."
+        elif inv_sc < 35:
+            summary = f"Avoid — investment score of {inv_sc} falls below acceptable thresholds."
+        else:
+            summary = "Avoid — property identity could not be confirmed with sufficient confidence."
+    else:
+        summary = "Conditional — proceed only if price is negotiated down and all risk factors are independently verified."
+
+    reasons: list[str] = []
+    if g_yield >= 6.5:
+        reasons.append(f"High gross yield of {g_yield:.1f}%")
+    elif g_yield >= 5.0:
+        reasons.append(f"Solid gross yield of {g_yield:.1f}%")
+    if cashflow > 0:
+        reasons.append(f"Positive monthly cashflow of £{cashflow:,}")
+    if inv_sc >= 65:
+        reasons.append(f"Strong investment score ({inv_sc}/100)")
+    if liq_sc >= 60:
+        reasons.append("Good liquidity — likely to sell within 3 months")
+    if rd_sc >= 65:
+        reasons.append("High rental demand in this area")
+    if growth_r >= 4:
+        reasons.append(f"Above-average capital growth forecast ({growth_r:.1f}%/yr)")
+    if risk_sc < 35:
+        reasons.append(f"Low overall risk profile ({risk_sc}/100)")
+    if not reasons:
+        reasons.append("No strong positive signals identified from available data")
+
+    risks: list[str] = []
+    if property_confidence == "low":
+        risks.append("Property identity not confirmed — data may not match the exact unit")
+    elif property_confidence == "medium":
+        risks.append("Property match is approximate — verify details before proceeding")
+    if g_yield < 5.0:
+        risks.append(f"Yield of {g_yield:.1f}% is below the 5% investment threshold")
+    if cashflow < 0:
+        risks.append(f"Negative cashflow of £{abs(cashflow):,}/month — deal is not self-funding")
+    if risk_sc >= 55:
+        risks.append(f"Elevated risk score ({risk_sc}/100)")
+    if flood_lv not in ("Unknown", "Very Low", "Low"):
+        risks.append(f"Flood risk rated {flood_lv}")
+    if conf_label == "Low":
+        risks.append("Low data confidence — all scores are estimates based on limited information")
+    elif conf_label == "Medium":
+        risks.append("Moderate data confidence — verify key figures independently")
+    if liq_sc < 40:
+        risks.append("Low liquidity — may be difficult to exit quickly if needed")
+    if not risks:
+        risks.append("No major risk flags identified from available data")
+
+    return {
+        "verdict":             verdict,
+        "max_offer_price":     max_offer,
+        "walk_away_price":     walk_away,
+        "best_strategy":       strategy,
+        "one_sentence_summary": summary,
+        "key_reasons":         reasons[:5],
+        "key_risks":           risks[:5],
+        "confidence_label":    conf_label,
+    }
+
+
+def _rank_nearby_postcodes(postcode: str, region: str, growth_r: float, trans_sc: int) -> list:
+    """
+    Score nearby postcode sectors using ONS regional data + sector proximity.
+    Pure computation — no additional API calls.
+    """
+    pc = postcode.strip().upper().replace(" ", "")
+    m = re.match(r'^([A-Z]{1,2}\d{1,2}[A-Z]?)(\d)', pc)
+    if not m:
+        return []
+    district   = m.group(1)
+    sector_num = int(m.group(2))
+
+    # Regional yield for this area
+    reg_yield = REGIONAL_YIELDS.get(
+        next((k for k in REGIONAL_YIELDS if k != "default" and k in region), "default"),
+        REGIONAL_YIELDS["default"],
+    )
+
+    results = []
+    for delta in range(-3, 4):
+        s = sector_num + delta
+        if not (1 <= s <= 9):
+            continue
+        sector = f"{district} {s}"
+        base = 50
+        base += int(growth_r * 3)          # growth premium
+        base += trans_sc * 2               # transport premium
+        base += (3 - abs(delta))           # proximity bonus (same sector = +3)
+        # Regional premium / discount
+        if any(k in region for k in ["london", "south east"]):
+            base += 8
+        elif any(k in region for k in ["north east", "wales"]):
+            base -= 4
+        elif any(k in region for k in ["north west", "midlands"]):
+            base += 3
+        score = max(20, min(95, base))
+        results.append({
+            "postcode_sector":     sector,
+            "opportunity_score":   score,
+            "opportunity_grade":   _grade(score),
+            "growth_rate_pct":     growth_r,
+            "estimated_yield_pct": round(reg_yield, 1),
+            "is_subject_sector":   delta == 0,
+        })
+
+    return sorted(results, key=lambda x: x["opportunity_score"], reverse=True)
+
+
+def _exit_strategy_engine(
+    est_value: int, growth_r: float, liq_sc: int, risk_sc: int, g_yield: float,
+    rent: int, beds: int, floor_area: float, strategy: str, region: str,
+    inv_sc: int, cashflow: int,
+) -> dict:
+    val_3yr  = int(est_value * ((1 + growth_r / 100) ** 3))
+    val_5yr  = int(est_value * ((1 + growth_r / 100) ** 5))
+    val_10yr = int(est_value * ((1 + growth_r / 100) ** 10))
+
+    # Pick the best exit based on deal profile
+    if cashflow < 0 or g_yield < 4:
+        best_exit  = "Sell after light refurbishment"
+        exit_value = int(est_value * 1.10)
+        timeline   = "6–12 months"
+        alt_exit   = "Sell as-is to stop holding cost bleed"
+    elif liq_sc >= 70 and growth_r >= 5:
+        best_exit  = "Refinance to release equity, continue holding"
+        exit_value = val_5yr
+        timeline   = "5–7 years"
+        alt_exit   = "Outright sale at 3-year mark if market peaks early"
+    elif g_yield >= 6.5:
+        best_exit  = "Long-term hold — sell at market peak"
+        exit_value = val_10yr
+        timeline   = "10+ years"
+        alt_exit   = "Portfolio remortgage to extract equity without selling"
+    elif beds >= 4:
+        best_exit  = "Sell as HMO to specialist buyer (tenants in situ)"
+        exit_value = int(est_value * 1.12)
+        timeline   = "3–5 years"
+        alt_exit   = "De-convert to family home before sale to widen buyer pool"
+    else:
+        best_exit  = "Standard open-market sale"
+        exit_value = val_5yr
+        timeline   = "5 years"
+        alt_exit   = "Partial equity release via remortgage to fund next acquisition"
+
+    gain        = max(0, exit_value - est_value)
+    cgt_est     = int(max(0, gain - 3_000) * 0.24)
+    net_proceeds = exit_value - cgt_est
+
+    return {
+        "best_exit_strategy":  best_exit,
+        "expected_exit_value": exit_value,
+        "exit_timeline":       timeline,
+        "alternative_exit":    alt_exit,
+        "projected_values":    {"3yr": val_3yr, "5yr": val_5yr, "10yr": val_10yr},
+        "estimated_cgt":       cgt_est,
+        "net_exit_proceeds":   net_proceeds,
+        "exit_roi_pct":        round((net_proceeds - est_value) / est_value * 100, 1) if est_value else 0,
+        "cgt_note":            "CGT at 24% (higher rate) on gain above £3,000 annual allowance.",
+    }
+
+
+def _enhanced_confidence(
+    sales: list, epc: dict, demo_d: dict, crime_tot: int,
+    ukhpi_d: dict, flood_d: dict, trans_d: dict,
+) -> dict:
+    n = len(sales)
+    latest = (sales[0].get("date") or "")[:7] if sales else None
+    months_old = None
+    if latest:
+        try:
+            sale_dt = datetime.strptime(latest, "%Y-%m")
+            months_old = (datetime.utcnow().year - sale_dt.year) * 12 + (datetime.utcnow().month - sale_dt.month)
+        except Exception:
+            pass
+
+    val_score  = 85 if n >= 8 else 65 if n >= 3 else 30
+    val_label  = "High" if n >= 8 else "Medium" if n >= 3 else "Low"
+    val_reason = (f"{n} comparable sales found" if n >= 3
+                  else f"Only {n} comparable sale(s) — valuation less reliable" if n > 0
+                  else "No comparable sales — valuation based on regional averages")
+
+    rent_score  = 80 if (bool(epc) and bool(demo_d)) else 60 if bool(demo_d) else 40
+    rent_label  = "High" if (bool(epc) and bool(demo_d)) else "Medium" if bool(demo_d) else "Low"
+    rent_reason = ("EPC and demographics data available — rent estimate well-supported"
+                   if (bool(epc) and bool(demo_d)) else
+                   "Demographics available but no EPC — rent estimated from regional VOA data" if bool(demo_d)
+                   else "Limited data — rent is a regional default estimate")
+
+    prop_score  = 80 if bool(epc) else 30
+    prop_label  = "High" if bool(epc) else "Low"
+    prop_reason = ("EPC record found — property details confirmed" if bool(epc)
+                   else "No EPC record — bedrooms and floor area are not confirmed")
+
+    scores = [val_score, rent_score, prop_score, 85, 85]
+    overall_score = int(sum(scores) / len(scores))
+    overall_label = "High" if overall_score >= 75 else "Medium" if overall_score >= 50 else "Low"
+
+    epc_date = (epc.get("inspection-date") or epc.get("lodgement-date")) if epc else None
+    freshness = ("recent"   if (months_old or 24) <= 12
+                 else "moderate" if (months_old or 24) <= 24
+                 else "stale")
+
+    confidence = {
+        # Nested objects (Lovable-safe)
+        "overall":          {"label": overall_label, "score": overall_score, "reason": f"{overall_label} confidence — {val_reason.lower()}."},
+        "valuation":        {"label": val_label,  "score": val_score,  "reason": val_reason},
+        "rent":             {"label": rent_label,  "score": rent_score,  "reason": rent_reason},
+        "property_details": {"label": prop_label,  "score": prop_score,  "reason": prop_reason},
+        # Flat fields (safe for string interpolation in templates)
+        "overall_label":    overall_label,
+        "overall_score":    overall_score,
+        "overall_data_quality": overall_label.lower(),
+        "summary": (
+            f"{overall_label} confidence because "
+            + (f"EPC data exists but sale data is older ({months_old} months)." if (bool(epc) and months_old and months_old > 18)
+               else f"{n} comparable sales found and EPC data available." if (n >= 3 and bool(epc))
+               else f"only {n} sale(s) found — limited comparables." if n < 3
+               else "data sources available but coverage is partial.")
+        ),
+        # Legacy flat fields kept for backward compat
+        "valuation_score":  val_score,
+        "rent_score":       rent_score,
+        "growth":           "high",
+        "growth_score":     85,
+        "crime":            "high" if crime_tot > 0 else "low",
+        "crime_score":      85 if crime_tot > 0 else 20,
+        "flood":            "high" if flood_d.get("flood_zone") not in ("Unknown", None) else "medium",
+        "flood_score":      85 if flood_d.get("flood_zone") not in ("Unknown", None) else 40,
+        "transport":        "high" if trans_d.get("transport_score", 0) > 0 else "medium",
+        "transport_score":  80 if trans_d.get("transport_score", 0) > 0 else 40,
+        "data_points":      n,
+    }
+
+    data_age = {
+        "summary": (
+            f"Most recent sale: {months_old} months ago. "
+            f"EPC lodged: {epc_date or 'Unknown'}. "
+            f"Overall freshness: {freshness}."
+        ),
+        "last_sale_months_ago":  months_old,
+        "epc_lodgement_date":    epc_date,
+        "freshness_overall":     freshness,
+        # Full detail fields
+        "sales":    f"{months_old} months ago" if months_old is not None else "No sales data",
+        "epc":      epc_date or "Unknown",
+        "crime":    "Rolling 12 months (Police API, live)",
+        "growth":   "ONS UK HPI November 2024",
+        "rent":     "VOA Private Rental Statistics 2023-24",
+        "flood":    "EA Flood Map for Planning (live)",
+        "planning": "Gov.uk Planning Data API (live)",
+        "ukhpi":    ukhpi_d.get("data_period") or "Unknown",
+    }
+
+    return {"confidence": confidence, "data_age": data_age, "confidence_levels": confidence}
+
+
+def _build_data_quality(
+    epc: dict,
+    epc_list: list,
+    sales: list,
+    crime_tot: int,
+    demo_d: dict,
+    flood_d: dict,
+    trans_d: dict,
+    planning_d: dict,
+    schools_d: list,
+    ukhpi_price: float,
+    epc_matched_by: str,
+    property_confidence: str,
+    enh_conf: dict,
+) -> dict:
+    now = datetime.utcnow()
+
+    def _months_since(date_str: str) -> Optional[int]:
+        if not date_str:
+            return None
+        for fmt in ("%Y-%m-%d", "%Y-%m"):
+            try:
+                dt = datetime.strptime(date_str[: len(fmt)], fmt)
+                return (now.year - dt.year) * 12 + (now.month - dt.month)
+            except Exception:
+                pass
+        return None
+
+    def _freshness(months: Optional[int], recent_threshold: int = 12, moderate_threshold: int = 36) -> str:
+        if months is None:
+            return "unknown"
+        if months <= recent_threshold:
+            return "recent"
+        if months <= moderate_threshold:
+            return "moderate"
+        return "stale"
+
+    # ── EPC ──────────────────────────────────────────────────────────────────
+    epc_date = (epc.get("inspection-date") or epc.get("lodgement-date")) if epc else None
+    _epc_matched_by = epc_matched_by  # local copy; may be overwritten to "none"
+    if epc:
+        epc_status = "found"
+        epc_freshness = _freshness(_months_since(epc_date), recent_threshold=24, moderate_threshold=60)
+        if _epc_matched_by == "lmk_key":
+            epc_note = "Matched by exact certificate key — highest precision"
+        elif _epc_matched_by == "uprn":
+            epc_note = "Matched by UPRN — property-level match"
+        elif _epc_matched_by in ("postcode+address", "address"):
+            epc_note = "Matched by postcode + address string"
+        else:
+            n_recs = len(epc_list)
+            epc_note = f"Matched at postcode level ({n_recs} record{'s' if n_recs != 1 else ''} available) — may not be this exact property"
+    else:
+        epc_status = "missing"
+        _epc_matched_by = "none"
+        epc_freshness = "unknown"
+        epc_note = "No EPC record found — bedrooms and floor area are estimated defaults"
+
+    # ── Land Registry ────────────────────────────────────────────────────────
+    n_sales = len(sales)
+    latest_sale = (sales[0].get("date") or "")[:7] if sales else None
+    lr_freshness = _freshness(_months_since(latest_sale))
+    if n_sales >= 3:
+        lr_status = "found"
+        lr_note = f"{n_sales} comparable sales found"
+    elif n_sales > 0:
+        lr_status = "found"
+        lr_note = f"Only {n_sales} sale(s) — valuation less reliable"
+    else:
+        lr_status = "fallback"
+        lr_freshness = "unknown"
+        lr_note = "No sales found — valuation uses regional average prices"
+
+    # ── Crime ────────────────────────────────────────────────────────────────
+    crime_status = "found" if crime_tot > 0 else "missing"
+    crime_note = (f"{crime_tot} incidents in rolling 12 months" if crime_tot > 0
+                  else "No crime data returned for this area")
+
+    # ── Demographics ─────────────────────────────────────────────────────────
+    demo_status = "found" if demo_d else "missing"
+    demo_note = (
+        f"Region: {demo_d.get('region', 'Unknown')}, IMD decile: {demo_d.get('imd_decile', 'Unknown')}"
+        if demo_d else "No demographic data returned — region defaults used"
+    )
+
+    # ── Flood ────────────────────────────────────────────────────────────────
+    flood_known = flood_d.get("flood_zone") not in (None, "Unknown")
+    flood_status = "found" if flood_known else "missing"
+    flood_note = (f"Flood zone: {flood_d.get('flood_zone')}" if flood_known
+                  else "Flood zone data unavailable — risk flagged as unknown")
+
+    # ── Transport ────────────────────────────────────────────────────────────
+    trans_score = trans_d.get("transport_score", 0) if trans_d else 0
+    trans_status = "found" if trans_score > 0 else "missing"
+    trans_note = (f"Transport score: {trans_score}/100" if trans_score > 0
+                  else "No transport data — stations/stops not found via OSM")
+
+    # ── Planning ─────────────────────────────────────────────────────────────
+    plan_found = planning_d.get("risk_level") is not None
+    plan_status = "found" if plan_found else "missing"
+    plan_note = (f"Risk level: {planning_d.get('risk_level')}" if plan_found
+                 else "Planning data unavailable for this location")
+
+    # ── Schools ──────────────────────────────────────────────────────────────
+    school_status = "found" if schools_d else "missing"
+    school_note = (
+        f"{len(schools_d)} school{'s' if len(schools_d) != 1 else ''} found within 1km"
+        if schools_d else "No schools found within 1km"
+    )
+
+    # ── UKHPI ────────────────────────────────────────────────────────────────
+    ukhpi_status = "found" if ukhpi_price > 0 else "fallback"
+    ukhpi_note = ("District-level price data available" if ukhpi_price > 0
+                  else "No UKHPI data — market prices use regional ONS averages")
+
+    sources = [
+        {
+            "name": "EPC",
+            "status": epc_status,
+            "matched_by": _epc_matched_by,
+            "freshness": epc_freshness,
+            "note": epc_note,
+        },
+        {
+            "name": "Land Registry",
+            "status": lr_status,
+            "matched_by": "postcode" if n_sales > 0 else "none",
+            "freshness": lr_freshness,
+            "note": lr_note,
+        },
+        {
+            "name": "Crime",
+            "status": crime_status,
+            "matched_by": "coordinates" if crime_tot > 0 else "none",
+            "freshness": "recent" if crime_tot > 0 else "unknown",
+            "note": crime_note,
+        },
+        {
+            "name": "Demographics",
+            "status": demo_status,
+            "matched_by": "postcode" if demo_d else "none",
+            "freshness": "recent" if demo_d else "unknown",
+            "note": demo_note,
+        },
+        {
+            "name": "Flood",
+            "status": flood_status,
+            "matched_by": "coordinates" if flood_known else "none",
+            "freshness": "recent" if flood_known else "unknown",
+            "note": flood_note,
+        },
+        {
+            "name": "Transport",
+            "status": trans_status,
+            "matched_by": "coordinates" if trans_score > 0 else "none",
+            "freshness": "recent" if trans_score > 0 else "unknown",
+            "note": trans_note,
+        },
+        {
+            "name": "Planning",
+            "status": plan_status,
+            "matched_by": "coordinates" if plan_found else "none",
+            "freshness": "recent" if plan_found else "unknown",
+            "note": plan_note,
+        },
+        {
+            "name": "Schools",
+            "status": school_status,
+            "matched_by": "coordinates" if schools_d else "none",
+            "freshness": "recent" if schools_d else "unknown",
+            "note": school_note,
+        },
+        {
+            "name": "UKHPI",
+            "status": ukhpi_status,
+            "matched_by": "district" if ukhpi_price > 0 else "none",
+            "freshness": "recent" if ukhpi_price > 0 else "unknown",
+            "note": ukhpi_note,
+        },
+    ]
+
+    exact_match = property_confidence == "high"
+    overall_label = enh_conf["confidence"]["overall"]["label"]
+
+    warnings: list[str] = []
+    if not epc:
+        warnings.append("No EPC record — bedrooms and floor area are not confirmed")
+    elif _epc_matched_by == "postcode":
+        warnings.append("EPC matched at postcode level only — details may be from a nearby property")
+    if lr_status == "fallback":
+        warnings.append("No comparable sales — estimated value based on regional averages only")
+    if not exact_match:
+        warnings.append("Property not uniquely identified — provide a full address, UPRN, or lmk_key for higher precision")
+
+    if warnings:
+        user_warning = " | ".join(warnings)
+    elif overall_label == "High":
+        user_warning = "All key data sources returned results — high-confidence analysis"
+    else:
+        user_warning = "Analysis complete — review individual source statuses for data gaps"
+
+    return {
+        "overall_label": overall_label,
+        "exact_property_match": exact_match,
+        "sources": sources,
+        "user_warning": user_warning,
+    }
+
+
+# ── Fallback benchmark widget helpers (v6) ────────────────────────────────────
+
+def _yield_benchmark_widget(region: str, rent: int, est_value: int, sales: list, ukhpi_d: dict) -> dict:
+    """Yield comparison with full benchmark hierarchy: postcode → district → region → national."""
+    national_yield = 5.5
+    _rk = next((k for k in REGIONAL_YIELDS if k != "default" and k in region), "default")
+    regional_yield = REGIONAL_YIELDS[_rk]
+    subject_yield = round(rent * 12 / est_value * 100, 2) if est_value else None
+
+    # Postcode-level: computed from local Land Registry median
+    postcode_yield: Optional[float] = None
+    if len(sales) >= 3:
+        prices = [s.get("price_gbp", 0) for s in sales if s.get("price_gbp")]
+        if prices:
+            local_median = statistics.median(prices)
+            if local_median > 0:
+                postcode_yield = round(rent * 12 / local_median * 100, 2)
+
+    # District-level: UKHPI district average as value denominator
+    district_yield: Optional[float] = None
+    if ukhpi_d.get("district_avg") and ukhpi_d["district_avg"] > 0:
+        district_yield = round(rent * 12 / ukhpi_d["district_avg"] * 100, 2)
+
+    if postcode_yield is not None:
+        level_used = "postcode"
+        benchmark = postcode_yield
+        confidence = "medium"
+        reason = f"Derived from {len(sales)} local Land Registry transactions and VOA regional rent estimate."
+        fallback_source = "Land Registry comparable sales"
+    elif district_yield is not None:
+        level_used = "district"
+        benchmark = district_yield
+        confidence = "medium"
+        reason = "Exact postcode yield unavailable; district UKHPI average price used as denominator."
+        fallback_source = "UKHPI district average"
+    elif _rk != "default":
+        level_used = "region"
+        benchmark = regional_yield
+        confidence = "low"
+        reason = "District data unavailable; regional BM Solutions/Rightmove 2024 survey benchmark applied."
+        fallback_source = "Regional yield survey (BM Solutions/Rightmove 2024)"
+    else:
+        level_used = "national"
+        benchmark = national_yield
+        confidence = "low"
+        reason = "Regional data unavailable; UK national average yield used as fallback."
+        fallback_source = "National average (VOA/HMRC)"
+
+    if subject_yield is not None and benchmark:
+        diff = round(subject_yield - benchmark, 2)
+        if diff > 0.5:
+            comparison_label = f"Above {level_used} average by {diff:.1f}pp"
+        elif diff < -0.5:
+            comparison_label = f"Below {level_used} average by {abs(diff):.1f}pp"
+        else:
+            comparison_label = f"In line with {level_used} average ({benchmark:.1f}%)"
+    else:
+        comparison_label = f"{level_used.title()} benchmark: {benchmark:.1f}%"
+
+    return {
+        "available": True,
+        "subject_yield": subject_yield,
+        "postcode_average_yield": postcode_yield,
+        "district_average_yield": district_yield,
+        "regional_average_yield": regional_yield,
+        "national_average_yield": national_yield,
+        "comparison_label": comparison_label,
+        "level_used": level_used,
+        "confidence": confidence,
+        "reason": reason,
+        "fallback_source": fallback_source,
+        # Backward-compatible fields
+        "gross_yield_pct": subject_yield,
+        "regional_avg_yield_pct": regional_yield,
+        "national_avg_yield_pct": national_yield,
+        "vs_regional": round(subject_yield - regional_yield, 2) if subject_yield else None,
+        "rating": "Above average" if (subject_yield and subject_yield > regional_yield) else "Below average",
+    }
+
+
+def _market_trends_widget(region: str, growth_r: float, ukhpi_d: dict, sales: list, liq_sc: int) -> dict:
+    """Market trends with level hierarchy and confidence labels."""
+    if ukhpi_d.get("district_avg") and ukhpi_d.get("trend_pct_6m") is not None:
+        level_used = "district"
+        confidence = "medium"
+        reason = "District-level UKHPI data from HM Land Registry used."
+    elif region and region not in ("", "default"):
+        level_used = "region"
+        confidence = "low"
+        reason = "No district UKHPI data available; regional ONS HPI annual growth rate applied."
+    else:
+        level_used = "national"
+        confidence = "low"
+        reason = "Regional data unavailable; UK national ONS HPI average used as fallback."
+
+    if len(sales) >= 5:
+        recent = [s for s in sales if (s.get("date") or "") >= "2023-01-01"]
+        older  = [s for s in sales if (s.get("date") or "") <  "2023-01-01"]
+        if len(recent) > len(older):
+            volume_trend = "increasing"
+        elif older and len(recent) < len(older) * 0.7:
+            volume_trend = "decreasing"
+        else:
+            volume_trend = "stable"
+    elif len(sales) > 0:
+        volume_trend = "sparse"
+    else:
+        volume_trend = "no_data"
+
+    if liq_sc >= 70:
+        liquidity_signal = "high"
+    elif liq_sc >= 40:
+        liquidity_signal = "medium"
+    else:
+        liquidity_signal = "low"
+
+    price_trend_3yr = round((1 + growth_r / 100) ** 3 * 100 - 100, 1) if growth_r else None
+
+    return {
+        "available": True,
+        "level_used": level_used,
+        "price_trend_1yr": growth_r,
+        "price_trend_3yr": price_trend_3yr,
+        "transaction_volume_trend": volume_trend,
+        "liquidity_signal": liquidity_signal,
+        "confidence": confidence,
+        "reason": reason,
+        # Backward-compatible fields
+        "annual_growth_pct": growth_r,
+        "six_month_trend_pct": ukhpi_d.get("trend_pct_6m", 0),
+        "direction": ukhpi_d.get("trend_label", "Unknown"),
+        "source": "ONS UK HPI / UKHPI Land Registry",
+        "data_period": ukhpi_d.get("data_period", ""),
+    }
+
+
+def _school_rating_widget(schools_d: list) -> dict:
+    """School rating widget with confidence and fallback reason."""
+    if schools_d:
+        nearest = [
+            {"name": s["name"], "type": s.get("type", "school"), "distance_m": s.get("distance_m")}
+            for s in schools_d[:5]
+        ]
+        return {
+            "available": True,
+            "nearest_schools": nearest,
+            "average_rating_label": None,
+            "confidence": "medium",
+            "reason": (
+                f"{len(schools_d)} school(s) found within 1km via OpenStreetMap. "
+                "Ofsted ratings are not available from this data source — visit ofsted.gov.uk to check inspection reports."
+            ),
+            # Backward-compatible fields
+            "schools_within_1km": len(schools_d),
+            "nearest_school": schools_d[0]["name"],
+            "nearest_school_type": schools_d[0].get("type"),
+            "source": "OpenStreetMap",
+        }
+    return {
+        "available": False,
+        "nearest_schools": [],
+        "average_rating_label": None,
+        "confidence": "none",
+        "reason": (
+            "No schools found within 1km via OpenStreetMap. "
+            "This may reflect a rural location or an OSM data gap. "
+            "Check ofsted.gov.uk or compare.education.gov.uk for local schools."
+        ),
+    }
+
+
+def _deal_scanner_widget(
+    rpc: str,
+    region: str,
+    g_yield: float,
+    est_value: int,
+    rent: int,
+    rd_sc: int,
+    liq_sc: int,
+    growth_r: float,
+    sales: list,
+) -> dict:
+    """Local opportunity scanner. Signals derived from benchmarks when live listings unavailable."""
+    parts = rpc.strip().split()
+    if len(parts) >= 2:
+        postcode_sector = parts[0] + " " + parts[1][0]
+    else:
+        postcode_sector = rpc[:max(len(rpc) - 2, 1)]
+
+    _rk = next((k for k in REGIONAL_YIELDS if k != "default" and k in region), "default")
+    regional_yield = REGIONAL_YIELDS[_rk]
+    signals = []
+
+    diff_yield = round(g_yield - regional_yield, 1)
+    if diff_yield >= 1.0:
+        signals.append({
+            "signal": f"Yield {g_yield:.1f}% — {diff_yield}pp above regional average ({regional_yield:.1f}%)",
+            "strength": "high",
+            "reason": "Higher-than-average yield indicates strong rental income relative to purchase price.",
+        })
+    elif diff_yield > 0:
+        signals.append({
+            "signal": f"Yield {g_yield:.1f}% — marginally above regional average ({regional_yield:.1f}%)",
+            "strength": "medium",
+            "reason": "Yield is above regional benchmark but not significantly.",
+        })
+    else:
+        signals.append({
+            "signal": f"Yield {g_yield:.1f}% — below regional average ({regional_yield:.1f}%)",
+            "strength": "low",
+            "reason": "Below-benchmark yield; negotiating a lower price could improve returns.",
+        })
+
+    if rd_sc >= 70:
+        signals.append({
+            "signal": "High rental demand in this area",
+            "strength": "high",
+            "reason": "Strong transport links and local amenities drive above-average tenant demand.",
+        })
+    elif rd_sc >= 45:
+        signals.append({
+            "signal": "Moderate rental demand in this area",
+            "strength": "medium",
+            "reason": "Typical demand for the region — achievable with good property condition and management.",
+        })
+    else:
+        signals.append({
+            "signal": "Below-average rental demand signals",
+            "strength": "low",
+            "reason": "Weaker transport or amenity scores suggest demand may be slower; factor in void periods.",
+        })
+
+    if growth_r >= 5.5:
+        signals.append({
+            "signal": f"Above-average capital growth region ({growth_r:.1f}% p.a. ONS)",
+            "strength": "high",
+            "reason": "Above-average price growth indicates capital appreciation opportunity.",
+        })
+    elif growth_r >= 3.5:
+        signals.append({
+            "signal": f"Moderate capital growth region ({growth_r:.1f}% p.a. ONS)",
+            "strength": "medium",
+            "reason": "Steady growth in line with national trend.",
+        })
+
+    if liq_sc >= 60:
+        signals.append({
+            "signal": "Good market liquidity — active transaction volumes",
+            "strength": "medium",
+            "reason": "Active market indicates easier exit when needed.",
+        })
+    elif liq_sc < 30:
+        signals.append({
+            "signal": "Low market liquidity — fewer transactions in this area",
+            "strength": "low",
+            "reason": "Illiquid market may extend exit timeline and reduce negotiating power.",
+        })
+
+    deals = _find_deals(sales)
+    deal_sc_val = _deal_score_calc(sales)
+
+    if sales:
+        confidence = "medium"
+        reason = (
+            f"Opportunity analysis based on {len(sales)} Land Registry transaction(s), "
+            "regional yield benchmarks, rental demand score, and ONS growth data. "
+            "No live listing inventory available — signals are modelled from public data."
+        )
+    else:
+        confidence = "low"
+        reason = (
+            "No Land Registry transactions found for this postcode. "
+            "Opportunity signals are modelled from regional benchmarks, yield estimates, and area indicators. "
+            "No live listings data is available from this source."
+        )
+
+    return {
+        "available": True,
+        "postcode_sector": postcode_sector,
+        "opportunity_signals": signals,
+        "deals": deals,
+        "reason": reason,
+        "confidence": confidence,
+        # Backward-compatible fields
+        "postcode": rpc,
+        "score": deal_sc_val,
+        "label": _deal_label(deal_sc_val),
+        "median_price": int(statistics.median([s.get("price_gbp", 0) for s in sales if s.get("price_gbp")])) if sales else 0,
+    }
