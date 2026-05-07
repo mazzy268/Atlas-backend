@@ -3753,7 +3753,7 @@ def _yield_benchmark_widget(region: str, rent: int, est_value: int, sales: list,
     regional_yield = REGIONAL_YIELDS[_rk]
     subject_yield = round(rent * 12 / est_value * 100, 2) if est_value else None
 
-    # Postcode-level: computed from local Land Registry median
+    # Postcode-level: derived from local Land Registry median sale price
     postcode_yield: Optional[float] = None
     if len(sales) >= 3:
         prices = [s.get("price_gbp", 0) for s in sales if s.get("price_gbp")]
@@ -3762,60 +3762,86 @@ def _yield_benchmark_widget(region: str, rent: int, est_value: int, sales: list,
             if local_median > 0:
                 postcode_yield = round(rent * 12 / local_median * 100, 2)
 
-    # District-level: UKHPI district average as value denominator
+    # District-level: UKHPI district average price as denominator
     district_yield: Optional[float] = None
     if ukhpi_d.get("district_avg") and ukhpi_d["district_avg"] > 0:
         district_yield = round(rent * 12 / ukhpi_d["district_avg"] * 100, 2)
 
+    # Select best available benchmark level
     if postcode_yield is not None:
-        level_used = "postcode"
-        benchmark = postcode_yield
+        benchmark_level = "postcode"
+        benchmark_yield = postcode_yield
         confidence = "medium"
-        reason = f"Derived from {len(sales)} local Land Registry transactions and VOA regional rent estimate."
-        fallback_source = "Land Registry comparable sales"
+        reason = (
+            f"Benchmark derived from {len(sales)} local Land Registry sales (median price) "
+            "and VOA regional rent estimate. Postcode-level — modelled, not surveyed."
+        )
+        benchmark_label = f"Postcode benchmark (Land Registry, {len(sales)} sales) — modelled"
+        data_sources = ["Land Registry", "modelled rent estimate"]
     elif district_yield is not None:
-        level_used = "district"
-        benchmark = district_yield
+        benchmark_level = "district"
+        benchmark_yield = district_yield
         confidence = "medium"
-        reason = "Exact postcode yield unavailable; district UKHPI average price used as denominator."
-        fallback_source = "UKHPI district average"
+        reason = (
+            "Postcode-level sales data insufficient; district UKHPI average price used as benchmark denominator. "
+            "Benchmark is modelled — treat as indicative."
+        )
+        benchmark_label = "District benchmark (UKHPI average price) — modelled"
+        data_sources = ["Land Registry", "modelled rent estimate"]
     elif _rk != "default":
-        level_used = "region"
-        benchmark = regional_yield
+        benchmark_level = "region"
+        benchmark_yield = regional_yield
         confidence = "low"
-        reason = "District data unavailable; regional BM Solutions/Rightmove 2024 survey benchmark applied."
-        fallback_source = "Regional yield survey (BM Solutions/Rightmove 2024)"
+        reason = (
+            "District UKHPI data unavailable; regional gross yield benchmark applied "
+            "(BM Solutions/Rightmove 2024 survey). Modelled — not property-specific."
+        )
+        benchmark_label = f"Regional benchmark ({region.title()}) — BM Solutions/Rightmove 2024 survey"
+        data_sources = ["modelled rent estimate"]
     else:
-        level_used = "national"
-        benchmark = national_yield
+        benchmark_level = "national"
+        benchmark_yield = national_yield
         confidence = "low"
-        reason = "Regional data unavailable; UK national average yield used as fallback."
-        fallback_source = "National average (VOA/HMRC)"
+        reason = (
+            "Regional data unavailable; UK national average gross yield used as fallback. "
+            "Modelled — broad estimate only."
+        )
+        benchmark_label = "National benchmark (UK average) — modelled fallback"
+        data_sources = ["modelled rent estimate"]
 
-    if subject_yield is not None and benchmark:
-        diff = round(subject_yield - benchmark, 2)
-        if diff > 0.5:
-            comparison_label = f"Above {level_used} average by {diff:.1f}pp"
-        elif diff < -0.5:
-            comparison_label = f"Below {level_used} average by {abs(diff):.1f}pp"
+    # Performance label and delta
+    if subject_yield is not None and benchmark_yield:
+        comparison_delta_pct = round(subject_yield - benchmark_yield, 2)
+        if comparison_delta_pct > 0.5:
+            performance_label = "above benchmark"
+        elif comparison_delta_pct < -0.5:
+            performance_label = "below benchmark"
         else:
-            comparison_label = f"In line with {level_used} average ({benchmark:.1f}%)"
+            performance_label = "in line"
     else:
-        comparison_label = f"{level_used.title()} benchmark: {benchmark:.1f}%"
+        comparison_delta_pct = None
+        performance_label = "in line"
 
     return {
+        # ── New spec fields ──
         "available": True,
         "subject_yield": subject_yield,
+        "benchmark_yield": benchmark_yield,
+        "benchmark_level": benchmark_level,
+        "benchmark_label": benchmark_label,
+        "comparison_delta_pct": comparison_delta_pct,
+        "performance_label": performance_label,
+        "confidence": confidence,
+        "reason": reason,
+        "data_sources": data_sources,
+        # ── Backward-compatible fields ──
         "postcode_average_yield": postcode_yield,
         "district_average_yield": district_yield,
         "regional_average_yield": regional_yield,
         "national_average_yield": national_yield,
-        "comparison_label": comparison_label,
-        "level_used": level_used,
-        "confidence": confidence,
-        "reason": reason,
-        "fallback_source": fallback_source,
-        # Backward-compatible fields
+        "level_used": benchmark_level,
+        "fallback_source": benchmark_label,
+        "comparison_label": performance_label,
         "gross_yield_pct": subject_yield,
         "regional_avg_yield_pct": regional_yield,
         "national_avg_yield_pct": national_yield,
