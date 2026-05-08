@@ -446,6 +446,7 @@ async def analyse_property(request: Request):
     _mkt_trends["district"] = demo_d.get("admin_district", "")
     _school_rat   = _school_rating_widget(schools_d, postcode=rpc)
     _trans_widget = _transport_widget(trans_d)
+    _comp_sales   = await _comparable_sales_widget(sales, rpc, region, demo_d, ukhpi_d)
     _deal_scan    = _deal_scanner_widget(rpc, region, g_yield, est_value, rent, rd_sc, liq_sc, growth_r, sales)
 
     # Append fallback benchmark sources to data quality panel
@@ -782,6 +783,8 @@ async def analyse_property(request: Request):
         "school_rating": _school_rat,
 
         "transport": _trans_widget,
+
+        "comparable_sales": _comp_sales,
 
         "deal_scanner": _deal_scan,
 
@@ -1391,83 +1394,102 @@ async def _fetch_demographics(postcode: str) -> dict:
     return {}
 
 
-async def _fetch_sales(postcode: str, limit: int = 20) -> list:
+class _SalesResult(list):
+    """list subclass that carries which fallback level produced the results."""
+    def __init__(self, data=(), level: str = "postcode_district"):
+        super().__init__(data)
+        self.level_used = level
+
+
+_HMLR_PREFIXES = (
+    "PREFIX lrppi: <http://landregistry.data.gov.uk/def/ppi/>\n"
+    "PREFIX lrcommon: <http://landregistry.data.gov.uk/def/common/>\n"
+)
+
+_HMLR_SELECT = (
+    "SELECT ?amount ?date ?propertyType ?estateType ?paon ?street WHERE {\n"
+    "  ?trans lrppi:pricePaid ?amount ;\n"
+    "         lrppi:transactionDate ?date ;\n"
+    "         lrppi:propertyType ?propertyType ;\n"
+    "         lrppi:estateType ?estateType ;\n"
+    "         lrppi:propertyAddress ?addr .\n"
+    "  {pc_clause}\n"
+    "  OPTIONAL { ?addr lrcommon:paon ?paon }\n"
+    "  OPTIONAL { ?addr lrcommon:street ?street }\n"
+    "}\n"
+    "ORDER BY DESC(?date)\n"
+    "LIMIT {n}\n"
+)
+
+
+def _hmlr_parse(bindings: list) -> list:
+    return [
+        {
+            "price_gbp":     int(float(b["amount"]["value"])),
+            "date":          b["date"]["value"],
+            "property_type": b.get("propertyType", {}).get("value", "").split("/")[-1],
+            "tenure":        "Freehold" if "freehold" in b.get("estateType", {}).get("value", "").lower() else "Leasehold",
+            "address_paon":  b.get("paon", {}).get("value", ""),
+            "street":        b.get("street", {}).get("value", ""),
+        }
+        for b in bindings if "amount" in b
+    ]
+
+
+async def _hmlr_sparql(query: str) -> list:
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                HMLR,
+                params={"query": query, "output": "json"},
+                headers={"Accept": "application/sparql-results+json"},
+            )
+            resp.raise_for_status()
+            return _hmlr_parse(resp.json().get("results", {}).get("bindings", []))
+    except Exception:
+        return []
+
+
+def _hmlr_query_postcode(pc_filter: str, is_prefix: bool, n: int) -> str:
+    if is_prefix:
+        clause = f'?addr lrcommon:postcode ?_pc . FILTER(STRSTARTS(?_pc, "{pc_filter}"))'
+    else:
+        clause = f'?addr lrcommon:postcode "{pc_filter}" .'
+    return _HMLR_PREFIXES + _HMLR_SELECT.format(pc_clause=clause, n=n)
+
+
+def _hmlr_query_town(town: str, n: int) -> str:
+    clause = f'?addr lrcommon:town "{town.upper()}" .'
+    return _HMLR_PREFIXES + _HMLR_SELECT.format(pc_clause=clause, n=n)
+
+
+async def _fetch_sales(postcode: str, limit: int = 20) -> _SalesResult:
     pc_raw = postcode.strip().upper().replace(" ", "")
-    # Normalise to spaced format: "NE156DL" → "NE15 6DL" (HMLR stores with space)
     pc_spaced = (pc_raw[:-3] + " " + pc_raw[-3:]) if len(pc_raw) >= 5 else postcode.strip().upper()
-    # Derive sector: "NE15 6DL" → "NE15 6"
     m_sec = re.match(r'^([A-Z]{1,2}\d{1,2}[A-Z]?) ?(\d)', pc_spaced)
     sector = f"{m_sec.group(1)} {m_sec.group(2)}" if m_sec else None
+    district = pc_spaced.split(" ")[0]
 
-    def _build_query(pc_filter: str, is_sector: bool, n: int) -> str:
-        if is_sector:
-            pc_clause = f'?addr lrcommon:postcode ?_pc . FILTER(STRSTARTS(?_pc, "{pc_filter}"))'
-        else:
-            pc_clause = f'?addr lrcommon:postcode "{pc_filter}" .'
-        return f"""
-PREFIX lrppi: <http://landregistry.data.gov.uk/def/ppi/>
-PREFIX lrcommon: <http://landregistry.data.gov.uk/def/common/>
-SELECT ?amount ?date ?propertyType ?estateType ?paon ?street WHERE {{
-  ?trans lrppi:pricePaid ?amount ;
-         lrppi:transactionDate ?date ;
-         lrppi:propertyType ?propertyType ;
-         lrppi:estateType ?estateType ;
-         lrppi:propertyAddress ?addr .
-  {pc_clause}
-  OPTIONAL {{ ?addr lrcommon:paon ?paon }}
-  OPTIONAL {{ ?addr lrcommon:street ?street }}
-}}
-ORDER BY DESC(?date)
-LIMIT {n}
-"""
-
-    def _parse_bindings(bindings: list) -> list:
-        return [
-            {
-                "price_gbp":     int(float(b["amount"]["value"])),
-                "date":          b["date"]["value"],
-                "property_type": b.get("propertyType", {}).get("value", "").split("/")[-1],
-                "tenure":        "Freehold" if "freehold" in b.get("estateType", {}).get("value", "").lower() else "Leasehold",
-                "address_paon":  b.get("paon", {}).get("value", ""),
-                "street":        b.get("street", {}).get("value", ""),
-            }
-            for b in bindings if "amount" in b
-        ]
-
-    async def _run_sparql(query: str) -> list:
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    HMLR,
-                    params={"query": query, "output": "json"},
-                    headers={"Accept": "application/sparql-results+json"},
-                )
-                resp.raise_for_status()
-                return _parse_bindings(resp.json().get("results", {}).get("bindings", []))
-        except Exception:
-            return []
-
-    # First: exact postcode (fast, precise)
-    exact = await _run_sparql(_build_query(pc_spaced, is_sector=False, n=10))
+    # Level 1: exact postcode
+    exact = await _hmlr_sparql(_hmlr_query_postcode(pc_spaced, is_prefix=False, n=10))
     if len(exact) >= 5 or not sector:
-        return exact
+        return _SalesResult(exact, level="exact_postcode")
 
-    # Widen to postcode sector for 10–50× more comparables
-    sector_results = await _run_sparql(_build_query(sector, is_sector=True, n=limit))
+    # Level 2: postcode sector
+    sector_rows = await _hmlr_sparql(_hmlr_query_postcode(sector, is_prefix=True, n=limit))
     seen = {(s["price_gbp"], s["date"], s["address_paon"]) for s in exact}
-    merged = exact + [s for s in sector_results if (s["price_gbp"], s["date"], s["address_paon"]) not in seen]
+    merged = exact + [s for s in sector_rows if (s["price_gbp"], s["date"], s["address_paon"]) not in seen]
     merged.sort(key=lambda x: x.get("date", ""), reverse=True)
     if len(merged) >= 5:
-        return merged[:limit]
+        return _SalesResult(merged[:limit], level="postcode_sector")
 
-    # Last resort: widen to full postcode district (e.g. "NE15")
-    district = pc_spaced.split(" ")[0]  # "NE15 6DL" → "NE15"
+    # Level 3: postcode district
     if district and district != sector:
-        district_results = await _run_sparql(_build_query(district + " ", is_sector=True, n=limit))
+        district_rows = await _hmlr_sparql(_hmlr_query_postcode(district + " ", is_prefix=True, n=limit))
         seen2 = {(s["price_gbp"], s["date"], s["address_paon"]) for s in merged}
-        merged = merged + [s for s in district_results if (s["price_gbp"], s["date"], s["address_paon"]) not in seen2]
+        merged = merged + [s for s in district_rows if (s["price_gbp"], s["date"], s["address_paon"]) not in seen2]
         merged.sort(key=lambda x: x.get("date", ""), reverse=True)
-    return merged[:limit]
+    return _SalesResult(merged[:limit], level="postcode_district")
 
 
 async def _fetch_epc(postcode: str, address_hint: str = "", uprn: str = "", lmk_key: str = "") -> list:
@@ -4274,6 +4296,116 @@ def _school_rating_widget(schools_d: list, postcode: str = "") -> dict:
         "nearest_school": None,
         "nearest_school_type": None,
         "source": None,
+    }
+
+
+_PROP_TYPE_LABELS = {
+    "detached": "Detached", "semi-detached": "Semi-detached",
+    "terraced": "Terraced", "flat-maisonette": "Flat/Apartment",
+    "D": "Detached", "S": "Semi-detached", "T": "Terraced",
+    "F": "Flat/Apartment", "O": "Other",
+}
+
+_LEVEL_DISTANCE_NOTE = {
+    "exact_postcode":    "Same postcode",
+    "postcode_sector":   "Same postcode sector (~0.5 mile radius)",
+    "postcode_district": "Same postcode district (~2 mile radius)",
+    "town":              "Same town / local authority area",
+    "region":            "Regional average — not a specific transaction",
+}
+
+_LEVEL_CONFIDENCE = {
+    "exact_postcode": "high", "postcode_sector": "high",
+    "postcode_district": "medium", "town": "low", "region": "low",
+}
+
+
+def _format_comparable(s: dict, level: str) -> dict:
+    address = f"{s.get('address_paon', '').strip()} {s.get('street', '').strip()}".strip()
+    raw_type = s.get("property_type", "")
+    return {
+        "address_or_area": address or "Nearby property",
+        "price":           s.get("price_gbp", 0),
+        "sale_date":       s.get("date", ""),
+        "property_type":   _PROP_TYPE_LABELS.get(raw_type) or (raw_type.title() if raw_type else None),
+        "distance_note":   _LEVEL_DISTANCE_NOTE.get(level, "Area comparable"),
+        "confidence":      _LEVEL_CONFIDENCE.get(level, "low"),
+    }
+
+
+async def _comparable_sales_widget(
+    sales: list,
+    rpc: str,
+    region: str,
+    demo_d: dict,
+    ukhpi_d: dict,
+) -> dict:
+    """Comparable sales widget with 4-level fallback hierarchy."""
+
+    # ── Level 1-3: already resolved by _fetch_sales ──────────────────────────
+    if sales:
+        level = getattr(sales, "level_used", "postcode_district")
+        comps = [_format_comparable(s, level) for s in sales[:6]]
+        n = len(sales)
+        reason = (
+            f"{n} Land Registry transaction(s) found at {level.replace('_', ' ')} level. "
+            "Sorted by most recent sale date."
+        )
+        return {
+            "available":  True,
+            "level_used": level,
+            "comparables": comps,
+            "reason":     reason,
+        }
+
+    # ── Level 4: town / local authority SPARQL ────────────────────────────────
+    town = (demo_d.get("admin_district") or demo_d.get("local_authority") or "").strip()
+    if town:
+        town_rows = await _hmlr_sparql(_hmlr_query_town(town, n=8))
+        if town_rows:
+            comps = [_format_comparable(s, "town") for s in town_rows[:6]]
+            return {
+                "available":  True,
+                "level_used": "town",
+                "comparables": comps,
+                "reason":     (
+                    f"No transactions found at postcode level. "
+                    f"{len(town_rows)} sale(s) found in {town} (town/LA level)."
+                ),
+            }
+
+    # ── Level 5: region — use UKHPI district average as a reference ──────────
+    district_avg = ukhpi_d.get("district_avg") or ukhpi_d.get("regional_avg")
+    district_name = demo_d.get("admin_district") or region
+    data_period = ukhpi_d.get("data_period", "recent period")
+    if district_avg:
+        return {
+            "available":  True,
+            "level_used": "region",
+            "comparables": [{
+                "address_or_area": f"{district_name} (district average)",
+                "price":           int(district_avg),
+                "sale_date":       data_period,
+                "property_type":   None,
+                "distance_note":   _LEVEL_DISTANCE_NOTE["region"],
+                "confidence":      "low",
+            }],
+            "reason": (
+                "No specific transaction data found for this postcode or town. "
+                f"UKHPI district average for {district_name} used as a reference only — "
+                "not a real comparable sale."
+            ),
+        }
+
+    # ── Nothing found ─────────────────────────────────────────────────────────
+    return {
+        "available":  False,
+        "level_used": "none",
+        "comparables": [],
+        "reason": (
+            "No Land Registry transactions found for this postcode, district, or area. "
+            "The property may be in a low-transaction postcode or the address could not be matched."
+        ),
     }
 
 
