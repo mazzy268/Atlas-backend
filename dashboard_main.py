@@ -441,11 +441,12 @@ async def analyse_property(request: Request):
     ]
 
     # Build enhanced widgets with fallback hierarchy
-    _yield_comp = _yield_benchmark_widget(region, rent, est_value, sales, ukhpi_d)
-    _mkt_trends = _market_trends_widget(region, growth_r, ukhpi_d, sales, liq_sc, postcode=rpc)
+    _yield_comp   = _yield_benchmark_widget(region, rent, est_value, sales, ukhpi_d)
+    _mkt_trends   = _market_trends_widget(region, growth_r, ukhpi_d, sales, liq_sc, postcode=rpc)
     _mkt_trends["district"] = demo_d.get("admin_district", "")
-    _school_rat = _school_rating_widget(schools_d, postcode=rpc)
-    _deal_scan  = _deal_scanner_widget(rpc, region, g_yield, est_value, rent, rd_sc, liq_sc, growth_r, sales)
+    _school_rat   = _school_rating_widget(schools_d, postcode=rpc)
+    _trans_widget = _transport_widget(trans_d)
+    _deal_scan    = _deal_scanner_widget(rpc, region, g_yield, est_value, rent, rd_sc, liq_sc, growth_r, sales)
 
     # Append fallback benchmark sources to data quality panel
     if _yield_comp["level_used"] != "postcode":
@@ -636,9 +637,13 @@ async def analyse_property(request: Request):
             "income_estimate": _income_est(region),
             "investor_appeal": "High" if inv_sc >= 65 else "Medium" if inv_sc >= 45 else "Low",
             "transport_score": trans_sc,
-            "transport_summary": _transport_summary(trans_d),
+            "transport_grade": _trans_widget["grade"],
+            "transport_summary": _trans_widget["summary"],
             "nearest_stations": (trans_d.get("nearest_stations") or [])[:3],
             "bus_stop_count": trans_d.get("bus_stop_count", 0),
+            "rail_count": trans_d.get("rail_count", 0),
+            "tube_count": trans_d.get("tube_count", 0),
+            "tram_count": trans_d.get("tram_count", 0),
             "schools_nearby": schools_d,
             "nearest_school": schools_d[0]["name"] if schools_d else "None found within 1km",
             "school_count_1km": len(schools_d),
@@ -775,6 +780,8 @@ async def analyse_property(request: Request):
         "market_trends": _mkt_trends,
 
         "school_rating": _school_rat,
+
+        "transport": _trans_widget,
 
         "deal_scanner": _deal_scan,
 
@@ -1599,36 +1606,117 @@ async def _fetch_flood(lat: float, lng: float) -> dict:
     return {"risk_level": "Unknown", "flood_zone": "Unknown", "flood_zone_label": "Data unavailable.", "active_warnings": []}
 
 
+_TRANSPORT_TYPE_MAP = {
+    "station":          "rail",
+    "halt":             "rail",
+    "tram_stop":        "tram",
+    "subway_entrance":  "tube",
+    "stop_position":    "bus",
+    "bus_stop":         "bus",
+}
+
+def _classify_station(tags: dict) -> str:
+    railway = tags.get("railway", "")
+    highway = tags.get("highway", "")
+    network  = tags.get("network", "").lower()
+    station  = tags.get("station", "")
+    if highway == "bus_stop" or tags.get("public_transport") == "stop_position":
+        return "bus"
+    if station == "subway" or "underground" in network or "tube" in network or "london underground" in network:
+        return "tube"
+    if railway == "tram_stop":
+        return "tram"
+    if railway in ("station", "halt"):
+        # distinguish heavy rail from light rail / metro by network tag
+        if any(k in network for k in ("metro", "overground", "elizabeth", "dlr")):
+            return "rail"
+        return "rail"
+    return _TRANSPORT_TYPE_MAP.get(railway, "rail")
+
+
+def _transport_score_calc(stations: list, bus_count: int) -> int:
+    """Distance-weighted score 0-10. Rail/tube > tram > bus."""
+    WEIGHTS = {"rail": 3, "tube": 3, "tram": 2, "bus": 0}
+    score = 0
+    for s in stations:
+        d = s["distance_m"]
+        w = WEIGHTS.get(s["transport_type"], 1)
+        if d <= 300:
+            score += w
+        elif d <= 600:
+            score += max(1, w - 1)
+        elif d <= 1000:
+            score += max(0, w - 2)
+    if bus_count >= 5:
+        score += 2
+    elif bus_count >= 2:
+        score += 1
+    return max(0, min(10, score))
+
+
 async def _fetch_transport(lat: float, lng: float) -> dict:
     query = f"""
-[out:json][timeout:10];
+[out:json][timeout:15];
 (
-  node["railway"~"station|halt"](around:800,{lat},{lng});
-  node["public_transport"="station"](around:800,{lat},{lng});
+  node["railway"~"station|halt|tram_stop|subway_entrance"](around:1200,{lat},{lng});
+  node["public_transport"="station"](around:1200,{lat},{lng});
+  node["station"="subway"](around:1200,{lat},{lng});
+  node["highway"="bus_stop"](around:500,{lat},{lng});
 );
 out body;
 """
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(OVERPASS, data={"data": query})
             resp.raise_for_status()
             elements = resp.json().get("elements", [])
-            stations = sorted(
-                [
-                    {
-                        "name":       e.get("tags", {}).get("name", "Unnamed station"),
-                        "type":       e.get("tags", {}).get("railway", "station"),
-                        "distance_m": _haversine(lat, lng, e.get("lat", lat), e.get("lon", lng)),
-                    }
-                    for e in elements
-                ],
-                key=lambda s: s["distance_m"],
-            )
-            score = 8 if len(stations) >= 3 else 6 if len(stations) >= 1 else 2
-            return {"transport_score": score, "nearest_stations": stations[:5], "bus_stop_count": 0}
+
+        seen_names: set = set()
+        stations: list = []
+        bus_stops: list = []
+
+        for e in elements:
+            tags = e.get("tags", {})
+            dist = round(_haversine(lat, lng, e.get("lat", lat), e.get("lon", lng)))
+            t_type = _classify_station(tags)
+            name = tags.get("name", "").strip()
+
+            if t_type == "bus":
+                bus_stops.append(dist)
+                continue
+
+            if not name:
+                continue
+            key = (name.lower(), t_type)
+            if key in seen_names:
+                continue
+            seen_names.add(key)
+            stations.append({
+                "name":           name,
+                "transport_type": t_type,
+                "distance_m":     dist,
+                "walking_mins":   max(1, round(dist / 80)),  # ~80 m/min walking
+                "lines":          tags.get("network", "") or tags.get("operator", ""),
+            })
+
+        stations.sort(key=lambda s: s["distance_m"])
+        bus_count = len(bus_stops)
+        score = _transport_score_calc(stations, bus_count)
+
+        return {
+            "transport_score":   score,
+            "nearest_stations":  stations[:6],
+            "bus_stop_count":    bus_count,
+            "rail_count":        sum(1 for s in stations if s["transport_type"] == "rail"),
+            "tube_count":        sum(1 for s in stations if s["transport_type"] == "tube"),
+            "tram_count":        sum(1 for s in stations if s["transport_type"] == "tram"),
+        }
     except Exception:
         pass
-    return {"transport_score": 0, "nearest_stations": [], "bus_stop_count": 0}
+    return {
+        "transport_score": 0, "nearest_stations": [], "bus_stop_count": 0,
+        "rail_count": 0, "tube_count": 0, "tram_count": 0,
+    }
 
 
 async def _fetch_ukhpi_data(admin_district: str, prop_type: str = "") -> dict:
@@ -2990,12 +3078,85 @@ def _income_est(region):
     if any(r in region for r in ["north east", "wales", "yorkshire"]): return "Below average — median ~£28k"
     return "Average — median ~£35k"
 
-def _transport_summary(transport):
+def _transport_grade(score: int) -> str:
+    if score >= 8: return "Excellent"
+    if score >= 6: return "Good"
+    if score >= 4: return "Average"
+    if score >= 2: return "Poor"
+    return "Very poor"
+
+
+def _transport_summary(transport: dict) -> str:
     stations = transport.get("nearest_stations") or []
     score = transport.get("transport_score", 0)
+    grade = _transport_grade(score)
     if not stations:
-        return f"Transport score {score}/10. No stations within 800m."
-    return f"Transport score {score}/10. Nearest: {stations[0]['name']} ({stations[0]['distance_m']}m)."
+        return f"{grade} transport ({score}/10). No rail/tube/tram stations found within 1.2km."
+    nearest = stations[0]
+    return (
+        f"{grade} transport ({score}/10). "
+        f"Nearest: {nearest['name']} ({nearest['distance_m']}m, ~{nearest['walking_mins']} min walk). "
+        f"{transport.get('bus_stop_count', 0)} bus stop(s) within 500m."
+    )
+
+
+def _transport_widget(trans_d: dict) -> dict:
+    """Structured transport widget always present in response."""
+    score = trans_d.get("transport_score", 0)
+    stations = trans_d.get("nearest_stations") or []
+    bus_count = trans_d.get("bus_stop_count", 0)
+    rail_count = trans_d.get("rail_count", 0)
+    tube_count = trans_d.get("tube_count", 0)
+    tram_count = trans_d.get("tram_count", 0)
+    available = bool(stations) or bus_count > 0
+
+    if not available:
+        return {
+            "available": False,
+            "transport_score": 0,
+            "grade": "Very poor",
+            "nearest_stations": [],
+            "bus_stop_count": 0,
+            "rail_count": 0,
+            "tube_count": 0,
+            "tram_count": 0,
+            "summary": "No public transport found within search radius.",
+            "confidence": "low",
+            "reason": "No stations or bus stops detected via OpenStreetMap within 1.2km.",
+        }
+
+    grade = _transport_grade(score)
+    if score >= 7:
+        confidence = "high"
+    elif score >= 4:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    parts = []
+    if rail_count:
+        parts.append(f"{rail_count} rail station(s)")
+    if tube_count:
+        parts.append(f"{tube_count} tube/metro station(s)")
+    if tram_count:
+        parts.append(f"{tram_count} tram stop(s)")
+    if bus_count:
+        parts.append(f"{bus_count} bus stop(s) within 500m")
+    reason = "; ".join(parts) + ". Data via OpenStreetMap." if parts else "Data via OpenStreetMap."
+
+    return {
+        "available": True,
+        "transport_score": score,
+        "grade": grade,
+        "nearest_stations": stations,
+        "bus_stop_count": bus_count,
+        "rail_count": rail_count,
+        "tube_count": tube_count,
+        "tram_count": tram_count,
+        "summary": _transport_summary(trans_d),
+        "confidence": confidence,
+        "reason": reason,
+    }
 
 def _red_flags(flood, crime_total, risk_score):
     flags = []
