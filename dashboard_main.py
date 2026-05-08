@@ -444,7 +444,7 @@ async def analyse_property(request: Request):
     _yield_comp = _yield_benchmark_widget(region, rent, est_value, sales, ukhpi_d)
     _mkt_trends = _market_trends_widget(region, growth_r, ukhpi_d, sales, liq_sc, postcode=rpc)
     _mkt_trends["district"] = demo_d.get("admin_district", "")
-    _school_rat = _school_rating_widget(schools_d)
+    _school_rat = _school_rating_widget(schools_d, postcode=rpc)
     _deal_scan  = _deal_scanner_widget(rpc, region, g_yield, est_value, rent, rd_sc, liq_sc, growth_r, sales)
 
     # Append fallback benchmark sources to data quality panel
@@ -3970,29 +3970,138 @@ def _market_trends_widget(region: str, growth_r: float, ukhpi_d: dict, sales: li
     }
 
 
-def _school_rating_widget(schools_d: list) -> dict:
-    """School rating widget with confidence and fallback reason."""
+@functools.lru_cache(maxsize=1)
+def _load_schools_ratings() -> dict:
+    """Load data/schools_ratings.csv once; return {DISTRICT: [school dicts]}."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "schools_ratings.csv")
+    if not os.path.exists(path):
+        return {}
+    result: dict = {}
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                d = row.get("postcode_district", "").strip().upper()
+                if d:
+                    result.setdefault(d, []).append(row)
+    except Exception:
+        return {}
+    return result
+
+
+def _area_rating_label(district_schools: list) -> tuple:
+    """Return (label_str, reason_str) from rated schools in a district."""
+    SCORE = {"Outstanding": 1, "Good": 2, "Requires improvement": 3, "Inadequate": 4}
+    scored = [SCORE[s["ofsted_rating"]] for s in district_schools if s.get("ofsted_rating") in SCORE]
+    if not scored:
+        return None, "Ofsted ratings not available for schools in this district."
+    total = len(scored)
+    good_or_better = sum(1 for v in scored if v <= 2)
+    pct = round(good_or_better / total * 100)
+    avg = sum(scored) / total
+    if avg <= 1.5:
+        label = "Predominantly Outstanding"
+    elif avg <= 2.0:
+        label = "Good"
+    elif avg <= 2.5:
+        label = "Mostly Good"
+    elif avg <= 3.0:
+        label = "Mixed"
+    else:
+        label = "Below average"
+    reason = (
+        f"{pct}% of {total} Ofsted-inspected schools in this postcode district "
+        f"are rated Good or Outstanding (DfE data, August 2025)."
+    )
+    return label, reason
+
+
+def _match_ofsted_rating(osm_name: str, district_schools: list) -> str | None:
+    """Fuzzy-match an OSM school name against DfE records; return rating or None."""
+    def _tokens(n: str) -> set:
+        return set(re.sub(r"[^a-z0-9 ]", "", n.lower()).split()) - {"school", "the", "and", "of", "st", ""}
+    osm_t = _tokens(osm_name)
+    if not osm_t:
+        return None
+    best_score, best_rating = 0, None
+    for s in district_schools:
+        dfe_t = _tokens(s.get("name", ""))
+        overlap = len(osm_t & dfe_t)
+        if overlap >= 2 and overlap > best_score:
+            best_score = overlap
+            best_rating = s.get("ofsted_rating") or None
+    return best_rating
+
+
+def _school_rating_widget(schools_d: list, postcode: str = "") -> dict:
+    """School rating widget backed by DfE/Ofsted data where available."""
+    district_code = postcode.split()[0].upper() if postcode else ""
+    dfe = _load_schools_ratings()
+    district_schools = dfe.get(district_code, []) if district_code else []
+
+    if district_schools:
+        area_label, area_reason = _area_rating_label(district_schools)
+        dfe_available = True
+        confidence = "high"
+        fallback_source = None
+    else:
+        area_label, area_reason = None, "School benchmark data is not connected yet for this area."
+        dfe_available = False
+        confidence = "low"
+        fallback_source = "DfE/Get Information About Schools and Ofsted data can be connected."
+
     if schools_d:
-        nearest = [
-            {"name": s["name"], "type": s.get("type", "school"), "distance_m": s.get("distance_m")}
-            for s in schools_d[:5]
-        ]
+        nearest = []
+        for s in schools_d[:5]:
+            entry = {
+                "name": s["name"],
+                "type": s.get("type", "school"),
+                "distance_m": s.get("distance_m"),
+                "ofsted_rating": None,
+            }
+            if district_schools:
+                entry["ofsted_rating"] = _match_ofsted_rating(s["name"], district_schools)
+            nearest.append(entry)
+
+        if dfe_available:
+            reason = (
+                f"{len(schools_d)} school(s) found nearby (OpenStreetMap). "
+                + area_reason
+            )
+        else:
+            reason = (
+                f"{len(schools_d)} school(s) found nearby via OpenStreetMap. "
+                "Ofsted ratings are not available from this data source."
+            )
+
         return {
             "available": True,
             "nearest_schools": nearest,
-            "average_rating_label": None,
-            "confidence": "low",
-            "reason": (
-                f"{len(schools_d)} school(s) found nearby via OpenStreetMap. "
-                "Ofsted ratings are not available from this data source."
-            ),
-            "fallback_source": "DfE/Get Information About Schools and Ofsted data can be connected.",
+            "average_rating_label": area_label,
+            "confidence": confidence,
+            "reason": reason,
+            "fallback_source": fallback_source,
             # Backward-compatible fields
             "schools_within_1km": len(schools_d),
             "nearest_school": schools_d[0]["name"],
             "nearest_school_type": schools_d[0].get("type"),
-            "source": "OpenStreetMap",
+            "source": "OpenStreetMap + DfE/Ofsted" if dfe_available else "OpenStreetMap",
         }
+
+    # No OSM schools found — still return DfE area summary if available
+    if dfe_available:
+        return {
+            "available": True,
+            "nearest_schools": [],
+            "average_rating_label": area_label,
+            "confidence": "medium",
+            "reason": f"No schools found nearby via OpenStreetMap, but {area_reason}",
+            "fallback_source": None,
+            "schools_within_1km": 0,
+            "nearest_school": None,
+            "nearest_school_type": None,
+            "source": "DfE/Ofsted",
+        }
+
     return {
         "available": False,
         "nearest_schools": [],
@@ -4000,6 +4109,10 @@ def _school_rating_widget(schools_d: list) -> dict:
         "confidence": "low",
         "reason": "School benchmark data is not connected yet for this area.",
         "fallback_source": "DfE/Get Information About Schools and Ofsted data can be connected.",
+        "schools_within_1km": 0,
+        "nearest_school": None,
+        "nearest_school_type": None,
+        "source": None,
     }
 
 
