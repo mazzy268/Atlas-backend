@@ -4288,107 +4288,152 @@ def _deal_scanner_widget(
     growth_r: float,
     sales: list,
 ) -> dict:
-    """Local opportunity scanner. Signals derived from benchmarks when live listings unavailable."""
+    """Local Opportunity Scanner. Signals only — no invented live deals."""
     parts = rpc.strip().split()
     if len(parts) >= 2:
         postcode_sector = parts[0] + " " + parts[1][0]
     else:
         postcode_sector = rpc[:max(len(rpc) - 2, 1)]
 
+    # Region key — used to pull the correct benchmark, never infer another region's signals
     _rk = next((k for k in REGIONAL_YIELDS if k != "default" and k in region), "default")
     regional_yield = REGIONAL_YIELDS[_rk]
     signals = []
 
-    diff_yield = round(g_yield - regional_yield, 1)
-    if diff_yield >= 1.0:
-        signals.append({
-            "signal": f"Yield {g_yield:.1f}% — {diff_yield}pp above regional average ({regional_yield:.1f}%)",
-            "strength": "high",
-            "reason": "Higher-than-average yield indicates strong rental income relative to purchase price.",
-        })
-    elif diff_yield > 0:
-        signals.append({
-            "signal": f"Yield {g_yield:.1f}% — marginally above regional average ({regional_yield:.1f}%)",
-            "strength": "medium",
-            "reason": "Yield is above regional benchmark but not significantly.",
-        })
-    else:
-        signals.append({
-            "signal": f"Yield {g_yield:.1f}% — below regional average ({regional_yield:.1f}%)",
-            "strength": "low",
-            "reason": "Below-benchmark yield; negotiating a lower price could improve returns.",
-        })
+    # ── Signal 1: yield vs regional benchmark ────────────────────────────────
+    if g_yield > 0:
+        diff = round(g_yield - regional_yield, 1)
+        if diff >= 1.5:
+            signals.append({
+                "signal": "Above-benchmark yield",
+                "strength": "high",
+                "reason": f"Gross yield {g_yield:.1f}% is {diff}pp above the {region} regional benchmark ({regional_yield:.1f}%). Strong income return relative to purchase price.",
+                "score_impact": 8,
+            })
+        elif diff >= 0.5:
+            signals.append({
+                "signal": "Slightly above-benchmark yield",
+                "strength": "medium",
+                "reason": f"Gross yield {g_yield:.1f}% is {diff}pp above the {region} regional benchmark ({regional_yield:.1f}%).",
+                "score_impact": 4,
+            })
+        else:
+            signals.append({
+                "signal": "Yield at or below regional benchmark",
+                "strength": "low",
+                "reason": f"Gross yield {g_yield:.1f}% is at or below the {region} benchmark ({regional_yield:.1f}%). Negotiating price down would improve returns.",
+                "score_impact": 0,
+            })
 
+    # ── Signal 2: rental demand ───────────────────────────────────────────────
     if rd_sc >= 70:
         signals.append({
-            "signal": "High rental demand in this area",
+            "signal": "High rental demand",
             "strength": "high",
-            "reason": "Strong transport links and local amenities drive above-average tenant demand.",
+            "reason": "Strong transport links and local amenity score drive above-average tenant demand in this area.",
+            "score_impact": 6,
         })
     elif rd_sc >= 45:
         signals.append({
-            "signal": "Moderate rental demand in this area",
+            "signal": "Moderate rental demand",
             "strength": "medium",
-            "reason": "Typical demand for the region — achievable with good property condition and management.",
+            "reason": "Demand is typical for this region. Achievable with good property condition and management.",
+            "score_impact": 3,
         })
     else:
         signals.append({
-            "signal": "Below-average rental demand signals",
+            "signal": "Below-average rental demand",
             "strength": "low",
-            "reason": "Weaker transport or amenity scores suggest demand may be slower; factor in void periods.",
+            "reason": "Weaker transport or amenity scores suggest tenant demand may be slower — factor in higher void periods.",
+            "score_impact": 0,
         })
 
+    # ── Signal 3: capital growth ──────────────────────────────────────────────
     if growth_r >= 5.5:
         signals.append({
-            "signal": f"Above-average capital growth region ({growth_r:.1f}% p.a. ONS)",
+            "signal": "Strong capital growth region",
             "strength": "high",
-            "reason": "Above-average price growth indicates capital appreciation opportunity.",
+            "reason": f"ONS data shows {growth_r:.1f}% p.a. price growth for {region} — above the national average. Good capital appreciation potential.",
+            "score_impact": 5,
         })
-    elif growth_r >= 3.5:
+    elif growth_r >= 3.0:
         signals.append({
-            "signal": f"Moderate capital growth region ({growth_r:.1f}% p.a. ONS)",
+            "signal": "Steady capital growth region",
             "strength": "medium",
-            "reason": "Steady growth in line with national trend.",
+            "reason": f"ONS data shows {growth_r:.1f}% p.a. price growth for {region} — in line with national trend.",
+            "score_impact": 2,
+        })
+    elif growth_r > 0:
+        signals.append({
+            "signal": "Below-average capital growth",
+            "strength": "low",
+            "reason": f"ONS data shows {growth_r:.1f}% p.a. price growth for {region} — below the national average.",
+            "score_impact": 0,
         })
 
-    if liq_sc >= 60:
+    # ── Signal 4: market liquidity ────────────────────────────────────────────
+    if liq_sc >= 65:
         signals.append({
-            "signal": "Good market liquidity — active transaction volumes",
+            "signal": "Active, liquid market",
             "strength": "medium",
-            "reason": "Active market indicates easier exit when needed.",
+            "reason": "High transaction volume signals a healthy, active market — easier entry and exit.",
+            "score_impact": 3,
         })
     elif liq_sc < 30:
         signals.append({
-            "signal": "Low market liquidity — fewer transactions in this area",
+            "signal": "Illiquid market — low transaction volume",
             "strength": "low",
-            "reason": "Illiquid market may extend exit timeline and reduce negotiating power.",
+            "reason": "Thin market may extend exit timeline and reduce negotiating power on sale.",
+            "score_impact": 0,
         })
 
-    deals = _find_deals(sales)
-    deal_sc_val = _deal_score_calc(sales)
+    # ── Signal 5: recent transaction momentum ────────────────────────────────
+    if len(sales) >= 4:
+        recent = [s for s in sales if (s.get("date") or "") >= "2023-01-01"]
+        if len(recent) >= 3:
+            signals.append({
+                "signal": "Recent transaction momentum",
+                "strength": "medium",
+                "reason": f"{len(recent)} of the last {len(sales)} comparable sales occurred after Jan 2023 — market is active.",
+                "score_impact": 2,
+            })
 
+    # ── Confidence and reason ─────────────────────────────────────────────────
     if sales:
         confidence = "medium"
-        reason = (
-            f"Opportunity analysis based on {len(sales)} Land Registry transaction(s), "
-            "regional yield benchmarks, rental demand score, and ONS growth data. "
-            "No live listing inventory available — signals are modelled from public data."
+        base_reason = (
+            f"Signals derived from {len(sales)} Land Registry sale(s), regional yield benchmarks, "
+            "rental demand score, and ONS growth data."
         )
     else:
         confidence = "low"
-        reason = (
+        base_reason = (
             "No Land Registry transactions found for this postcode. "
-            "Opportunity signals are modelled from regional benchmarks, yield estimates, and area indicators. "
-            "No live listings data is available from this source."
+            "Signals are modelled from regional benchmarks and area indicators only."
         )
+
+    strong_signals = [s for s in signals if s["strength"] != "low"]
+    opportunities_count = len(strong_signals)
+
+    if opportunities_count == 0:
+        final_reason = (
+            base_reason + " All signals are weak for this property — "
+            "consider negotiating price or reviewing a different area."
+        )
+    else:
+        final_reason = base_reason + " Live listing data is not connected; showing local opportunity signals instead."
+
+    deal_sc_val = _deal_score_calc(sales)
 
     return {
         "available": True,
         "postcode_sector": postcode_sector,
+        "title": "Local Opportunity Scanner",
+        "opportunities_count": opportunities_count,
         "opportunity_signals": signals,
-        "deals": deals,
-        "reason": reason,
+        "deals": [],
         "confidence": confidence,
+        "reason": final_reason,
         # Backward-compatible fields
         "postcode": rpc,
         "score": deal_sc_val,
