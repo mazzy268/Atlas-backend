@@ -14,6 +14,8 @@ Environment variables needed:
 """
 
 import asyncio
+import csv
+import functools
 import json
 import math
 import os
@@ -440,7 +442,7 @@ async def analyse_property(request: Request):
 
     # Build enhanced widgets with fallback hierarchy
     _yield_comp = _yield_benchmark_widget(region, rent, est_value, sales, ukhpi_d)
-    _mkt_trends = _market_trends_widget(region, growth_r, ukhpi_d, sales, liq_sc)
+    _mkt_trends = _market_trends_widget(region, growth_r, ukhpi_d, sales, liq_sc, postcode=rpc)
     _mkt_trends["district"] = demo_d.get("admin_district", "")
     _school_rat = _school_rating_widget(schools_d)
     _deal_scan  = _deal_scanner_widget(rpc, region, g_yield, est_value, rent, rd_sc, liq_sc, growth_r, sales)
@@ -3850,20 +3852,83 @@ def _yield_benchmark_widget(region: str, rent: int, est_value: int, sales: list,
     }
 
 
-def _market_trends_widget(region: str, growth_r: float, ukhpi_d: dict, sales: list, liq_sc: int) -> dict:
+@functools.lru_cache(maxsize=1)
+def _load_lr_summary() -> dict:
+    """Load data/land_registry_summary.csv once; return {DISTRICT: [{year, average_price, transactions}]}."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "land_registry_summary.csv")
+    if not os.path.exists(path):
+        return {}
+    result: dict = {}
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                district = row.get("postcode_district", "").strip().upper()
+                if not district:
+                    continue
+                result.setdefault(district, []).append({
+                    "year":          int(row["year"]),
+                    "average_price": int(float(row["average_price"])),
+                    "transactions":  int(row["transaction_count"]),
+                })
+    except Exception:
+        return {}
+    for d in result:
+        result[d].sort(key=lambda x: x["year"])
+    return result
+
+
+def _build_modelled_series(ukhpi_d: dict, growth_r: float) -> list:
+    """5-year backward-projected price series from annual growth rate."""
+    base = ukhpi_d.get("district_avg") or ukhpi_d.get("regional_avg") or 250_000
+    current_year = date.today().year
+    series = []
+    for i in range(4, -1, -1):
+        yr = current_year - i
+        price = int(base / ((1 + growth_r / 100) ** i)) if growth_r else int(base)
+        series.append({"year": yr, "average_price": price, "transactions": 0})
+    return series
+
+
+def _market_trends_widget(region: str, growth_r: float, ukhpi_d: dict, sales: list, liq_sc: int, postcode: str = "") -> dict:
     """Market trends with level hierarchy and confidence labels."""
-    if ukhpi_d.get("district_avg") and ukhpi_d.get("trend_pct_6m") is not None:
+    # Derive postcode district (e.g. "SW1A 2AA" -> "SW1A")
+    district_code = postcode.split()[0].upper() if postcode else ""
+    lr_data = _load_lr_summary()
+
+    # Resolve series and level
+    if district_code and district_code in lr_data:
+        rows = lr_data[district_code]
+        series = [{"year": r["year"], "average_price": r["average_price"], "transactions": r["transactions"]} for r in rows]
+        level_used = "district"
+        confidence = "high"
+        reason = f"District-level Land Registry price-paid data for {district_code}."
+        # Compute trends from actual series
+        prices = [r["average_price"] for r in rows]
+        price_trend_1yr  = round((prices[-1] / prices[-2] - 1) * 100, 1) if len(prices) >= 2 else growth_r
+        price_trend_3yr  = round((prices[-1] / prices[-4] - 1) * 100, 1) if len(prices) >= 4 else (
+            round((1 + price_trend_1yr / 100) ** 3 * 100 - 100, 1) if price_trend_1yr is not None else None
+        )
+    elif ukhpi_d.get("district_avg") and ukhpi_d.get("trend_pct_6m") is not None:
+        series = _build_modelled_series(ukhpi_d, growth_r)
         level_used = "district"
         confidence = "medium"
         reason = "District-level UKHPI data from HM Land Registry used."
+        price_trend_1yr = growth_r
+        price_trend_3yr = round((1 + growth_r / 100) ** 3 * 100 - 100, 1) if growth_r else None
     elif region and region not in ("", "default"):
+        series = _build_modelled_series(ukhpi_d, growth_r)
         level_used = "region"
         confidence = "low"
         reason = "No district UKHPI data available; regional ONS HPI annual growth rate applied."
+        price_trend_1yr = growth_r
+        price_trend_3yr = round((1 + growth_r / 100) ** 3 * 100 - 100, 1) if growth_r else None
     else:
-        level_used = "national"
+        series = _build_modelled_series(ukhpi_d, growth_r)
+        level_used = "modelled"
         confidence = "low"
-        reason = "Regional data unavailable; UK national ONS HPI average used as fallback."
+        reason = "No district or regional data available; national modelled estimate used."
+        price_trend_1yr = growth_r
+        price_trend_3yr = round((1 + growth_r / 100) ** 3 * 100 - 100, 1) if growth_r else None
 
     if len(sales) >= 5:
         recent = [s for s in sales if (s.get("date") or "") >= "2023-01-01"]
@@ -3886,12 +3951,11 @@ def _market_trends_widget(region: str, growth_r: float, ukhpi_d: dict, sales: li
     else:
         liquidity_signal = "low"
 
-    price_trend_3yr = round((1 + growth_r / 100) ** 3 * 100 - 100, 1) if growth_r else None
-
     return {
         "available": True,
         "level_used": level_used,
-        "price_trend_1yr": growth_r,
+        "series": series,
+        "price_trend_1yr": price_trend_1yr,
         "price_trend_3yr": price_trend_3yr,
         "transaction_volume_trend": volume_trend,
         "liquidity_signal": liquidity_signal,
