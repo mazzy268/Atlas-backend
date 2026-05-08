@@ -3981,11 +3981,12 @@ def _school_rating_widget(schools_d: list) -> dict:
             "available": True,
             "nearest_schools": nearest,
             "average_rating_label": None,
-            "confidence": "medium",
+            "confidence": "low",
             "reason": (
-                f"{len(schools_d)} school(s) found within 1km via OpenStreetMap. "
-                "Ofsted ratings are not available from this data source — visit ofsted.gov.uk to check inspection reports."
+                f"{len(schools_d)} school(s) found nearby via OpenStreetMap. "
+                "Ofsted ratings are not available from this data source."
             ),
+            "fallback_source": "DfE/Get Information About Schools and Ofsted data can be connected.",
             # Backward-compatible fields
             "schools_within_1km": len(schools_d),
             "nearest_school": schools_d[0]["name"],
@@ -3996,12 +3997,9 @@ def _school_rating_widget(schools_d: list) -> dict:
         "available": False,
         "nearest_schools": [],
         "average_rating_label": None,
-        "confidence": "none",
-        "reason": (
-            "No schools found within 1km via OpenStreetMap. "
-            "This may reflect a rural location or an OSM data gap. "
-            "Check ofsted.gov.uk or compare.education.gov.uk for local schools."
-        ),
+        "confidence": "low",
+        "reason": "School benchmark data is not connected yet for this area.",
+        "fallback_source": "DfE/Get Information About Schools and Ofsted data can be connected.",
     }
 
 
