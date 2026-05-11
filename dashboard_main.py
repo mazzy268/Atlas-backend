@@ -327,6 +327,33 @@ async def analyse_property(request: Request):
         displayed_beds = None
     displayed_baths = None  # EPC does not contain bathroom count
 
+    # ── Features 1 & 2: extract listing + assumption inputs ───────────────────
+    _listing     = body.get("listing") if isinstance(body.get("listing"), dict) else {}
+    _assumptions = body.get("assumptions") if isinstance(body.get("assumptions"), dict) else {}
+    _value_sources: dict = {}
+
+    if _listing.get("bedrooms") is not None:
+        try:
+            beds = int(_listing["bedrooms"])
+            displayed_beds = beds
+            _value_sources["bedrooms"] = "user_listing"
+        except (ValueError, TypeError):
+            _value_sources["bedrooms"] = "EPC" if (epc and epc.get("number-of-bedrooms")) else "modelled"
+    else:
+        _value_sources["bedrooms"] = "EPC" if (epc and epc.get("number-of-bedrooms")) else "modelled"
+
+    if _listing.get("property_type"):
+        prop_type = str(_listing["property_type"])
+        _value_sources["property_type"] = "user_listing"
+    else:
+        _value_sources["property_type"] = "EPC" if epc else "modelled"
+
+    if _listing.get("bathrooms") is not None:
+        try:
+            displayed_baths = int(_listing["bathrooms"])
+        except (ValueError, TypeError):
+            pass
+
     # Resolve crime/transport first — needed for rent calculation
     crime_tot   = crime_d.get("total_crimes", 0)
     crime_sc    = _crime_score(crime_tot)
@@ -349,13 +376,44 @@ async def analyse_property(request: Request):
     if not sales and est_value:
         rent = max(rent, _rent_from_value(est_value, region))
     est_value, rent, _val_warnings = _validate_financials(est_value, rent, region, sales)
-    g_yield     = round(rent * 12 / est_value * 100, 2) if est_value else 0.0
-    deposit     = int(est_value * 0.25)
-    loan        = est_value - deposit
-    mortgage    = int(loan * 0.055 / 12)
-    annual_costs = mortgage * 12 + int(est_value * 0.01) + int(rent * 12 * 0.10)
-    net_yield   = round((rent * 12 - annual_costs) / est_value * 100, 2) if est_value else 0.0
-    cashflow    = rent - mortgage - int(est_value * 0.01 / 12) - int(rent * 0.10)
+    # ── Features 1 & 2: rent override + assumption-driven recalculation ─────────
+    _asking_price = None
+    if _listing.get("asking_price") and int(_listing.get("asking_price") or 0) > 0:
+        _asking_price = int(_listing["asking_price"])
+        _value_sources["asking_price"] = "user_listing"
+
+    if _listing.get("estimated_rent") and int(_listing.get("estimated_rent") or 0) > 0:
+        rent = int(_listing["estimated_rent"])
+        _value_sources["monthly_rent"] = "user_listing"
+    elif _assumptions.get("monthly_rent") and int(_assumptions.get("monthly_rent") or 0) > 0:
+        rent = int(_assumptions["monthly_rent"])
+        _value_sources["monthly_rent"] = "user_assumptions"
+    else:
+        _value_sources["monthly_rent"] = "modelled"
+
+    if _assumptions.get("purchase_price") and int(_assumptions.get("purchase_price") or 0) > 0:
+        _calc_price = int(_assumptions["purchase_price"])
+        _value_sources["purchase_price"] = "user_assumptions"
+    elif _asking_price:
+        _calc_price = _asking_price
+        _value_sources["purchase_price"] = "user_listing"
+    else:
+        _calc_price = est_value
+        _value_sources["purchase_price"] = "modelled"
+
+    _deposit_pct   = float(_assumptions.get("deposit_percent") or 25) / 100
+    _mortgage_rate = float(_assumptions.get("mortgage_rate") or 5.5) / 100
+    _refurb_cost   = int(_assumptions.get("refurb_cost") or 0)
+    _holding_years = int(_assumptions.get("holding_period_years") or 5)
+    _exit_value_ov = int(_assumptions.get("exit_value") or 0)
+
+    g_yield     = round(rent * 12 / _calc_price * 100, 2) if _calc_price else 0.0
+    deposit     = int(_calc_price * _deposit_pct)
+    loan        = _calc_price - deposit
+    mortgage    = int(loan * _mortgage_rate / 12)
+    annual_costs = mortgage * 12 + int(_calc_price * 0.01) + int(rent * 12 * 0.10)
+    net_yield   = round((rent * 12 - annual_costs) / _calc_price * 100, 2) if _calc_price else 0.0
+    cashflow    = rent - mortgage - int(_calc_price * 0.01 / 12) - int(rent * 0.10)
     annual_p    = cashflow * 12
 
     growth_r    = _get_growth(region)
@@ -385,9 +443,9 @@ async def analyse_property(request: Request):
     hmo_rent    = hmo_rooms * hmo_room_r if hmo_rooms > 0 else 0
     hmo_yield   = round(hmo_rent * 12 / est_value * 100, 2) if est_value and hmo_rent else 0.0
 
-    stamp           = _stamp_duty(est_value, investor=True)
-    purchase_costs  = _purchase_costs(est_value, region)
-    mortgage_scens  = _mortgage_scenarios(est_value, rent, region)
+    stamp           = _stamp_duty(_calc_price, investor=True)
+    purchase_costs  = _purchase_costs(_calc_price, region)
+    mortgage_scens  = _mortgage_scenarios(_calc_price, rent, region)
     tax_anal        = _tax_analysis(rent, mortgage, est_value)
     ten_yr          = _ten_year_model(est_value, rent, growth_r, region)
     brrrr           = _brrrr_analysis(est_value, rent, region, floor_area)
@@ -866,6 +924,87 @@ async def analyse_property(request: Request):
                 "Property investment carries risk including potential loss of capital. "
                 "You should seek independent financial, legal, and surveying advice before making any investment decision."
             ),
+        },
+
+        # ── Feature 1: listing input echo ─────────────────────────────────────
+        "listing_data": {
+            "provided":                    bool(_listing),
+            "asking_price":                _asking_price,
+            "bedrooms_from_listing":       _listing.get("bedrooms"),
+            "property_type_from_listing":  _listing.get("property_type"),
+            "estimated_rent_from_listing": _listing.get("estimated_rent"),
+            "tenure_from_listing":         _listing.get("tenure"),
+            "source_url":                  _listing.get("source_url"),
+            "description_provided":        bool(_listing.get("description")),
+        },
+
+        # ── Feature 2: assumption editor output ───────────────────────────────
+        "assumptions_used": {
+            "purchase_price":       _calc_price,
+            "monthly_rent":         rent,
+            "deposit_percent":      round(_deposit_pct * 100, 1),
+            "mortgage_rate":        round(_mortgage_rate * 100, 2),
+            "refurb_cost":          _refurb_cost,
+            "holding_period_years": _holding_years,
+            "exit_value":           _exit_value_ov or None,
+            "source":               "user_assumptions" if _assumptions else "defaults",
+        },
+        "calculation_sources": _value_sources,
+
+        # ── Feature 3: sensitivity analysis ──────────────────────────────────
+        "sensitivity_analysis": _sensitivity_analysis(
+            _calc_price, rent, _deposit_pct, _mortgage_rate, _refurb_cost,
+        ),
+
+        # ── Feature 4: investor report ────────────────────────────────────────
+        "investor_report": _investor_report(
+            display_address=(f"{_addr_hint.title()}, {rpc}" if _addr_hint else rpc),
+            rpc=rpc,
+            est_value=est_value,
+            asking_price=_asking_price,
+            calc_price=_calc_price,
+            rent=rent,
+            g_yield=g_yield,
+            net_yield=net_yield,
+            inv_sc=inv_sc,
+            risk_sc=risk_sc,
+            cashflow=cashflow,
+            annual_p=annual_p,
+            deposit=deposit,
+            mortgage=mortgage,
+            stamp=stamp,
+            inv_verd=inv_verd,
+            inv_dec=inv_dec,
+            growth_r=growth_r,
+            val_5yr=val_5yr,
+            enh_conf=enh_conf,
+            strategy=strategy,
+            prop_type=prop_type,
+            beds=beds,
+            floor_area=floor_area,
+            reno_intel=reno_intel,
+            flood_lv=flood_lv,
+            crime_tot=crime_tot,
+            imd_decile=imd_decile,
+            value_sources=_value_sources,
+            listing=_listing,
+            assumptions=_assumptions,
+        ),
+
+        # ── Feature 5: comparison summary ────────────────────────────────────
+        "comparison_summary": {
+            "address":          (f"{_addr_hint.title()}, {rpc}" if _addr_hint else rpc),
+            "postcode":         rpc,
+            "estimated_value":  est_value,
+            "asking_price":     _asking_price,
+            "monthly_rent":     rent,
+            "gross_yield":      g_yield,
+            "net_yield":        net_yield,
+            "investment_score": inv_sc,
+            "risk_score":       risk_sc,
+            "verdict":          inv_verd.get("verdict", "CONDITIONAL"),
+            "max_offer_price":  inv_verd.get("max_offer_price"),
+            "confidence":       enh_conf["confidence"]["overall"]["label"],
         },
     }
 
@@ -3521,6 +3660,161 @@ def _investor_verdict(
         "key_reasons":         reasons[:5],
         "key_risks":           risks[:5],
         "confidence_label":    conf_label,
+    }
+
+
+def _sensitivity_analysis(
+    calc_price: int, rent: int, deposit_pct: float, mortgage_rate: float,
+    refurb_cost: int,
+) -> dict:
+    """Five what-if scenarios for stress-testing the investment case."""
+
+    def _scenario(sc_price: int, sc_rent: int, sc_rate: float, sc_refurb: int) -> dict:
+        sc_deposit      = int(sc_price * deposit_pct)
+        sc_loan         = sc_price - sc_deposit
+        sc_mortgage     = int(sc_loan * sc_rate / 12)
+        sc_annual_costs = sc_mortgage * 12 + int(sc_price * 0.01) + int(sc_rent * 12 * 0.10)
+        sc_cashflow     = sc_rent - sc_mortgage - int(sc_price * 0.01 / 12) - int(sc_rent * 0.10)
+        sc_yield        = round(sc_rent * 12 / sc_price * 100, 2) if sc_price else 0.0
+        sc_net_yield    = round((sc_rent * 12 - sc_annual_costs) / sc_price * 100, 2) if sc_price else 0.0
+        total_invested  = sc_deposit + sc_refurb + int(sc_price * 0.03)
+        sc_roi          = round(sc_cashflow * 12 / total_invested * 100, 1) if total_invested else 0.0
+        if sc_yield >= 6.5 and sc_cashflow > 0:
+            verdict = "strong"
+        elif sc_yield >= 5.0 and sc_cashflow >= 0:
+            verdict = "viable"
+        elif sc_cashflow < -200:
+            verdict = "cashflow_negative"
+        else:
+            verdict = "marginal"
+        return {
+            "cashflow": sc_cashflow,
+            "yield": sc_yield,
+            "net_yield": sc_net_yield,
+            "roi": sc_roi,
+            "verdict_impact": verdict,
+        }
+
+    return {
+        "rent_minus_10_percent":        _scenario(calc_price, int(rent * 0.9), mortgage_rate, refurb_cost),
+        "rent_plus_10_percent":         _scenario(calc_price, int(rent * 1.1), mortgage_rate, refurb_cost),
+        "interest_rate_plus_1_percent": _scenario(calc_price, rent, mortgage_rate + 0.01, refurb_cost),
+        "refurb_cost_plus_20_percent":  _scenario(calc_price, rent, mortgage_rate, int(refurb_cost * 1.2)),
+        "value_down_5_percent":         _scenario(int(calc_price * 0.95), rent, mortgage_rate, refurb_cost),
+    }
+
+
+def _investor_report(
+    display_address: str, rpc: str, est_value: int, asking_price,
+    calc_price: int, rent: int, g_yield: float, net_yield: float,
+    inv_sc: int, risk_sc: int, cashflow: int, annual_p: int,
+    deposit: int, mortgage: int, stamp: int,
+    inv_verd: dict, inv_dec: dict, growth_r: float, val_5yr: int,
+    enh_conf: dict, strategy: str, prop_type: str, beds: int,
+    floor_area: float, reno_intel: dict, flood_lv: str,
+    crime_tot: int, imd_decile: int, value_sources: dict,
+    listing: dict, assumptions: dict,
+) -> dict:
+    """Top-level investor report object powering PDF/report views."""
+    conf_label = enh_conf["confidence"]["overall"]["label"]
+    verdict    = inv_verd.get("verdict", "CONDITIONAL")
+    beds_label = f"{beds}-bed " if beds else ""
+
+    executive_summary = (
+        f"{display_address}: {beds_label}{prop_type} estimated at £{est_value:,}. "
+        f"Analysed at £{calc_price:,} — gross yield {g_yield:.1f}%, "
+        f"monthly cashflow £{cashflow:,}. Verdict: {verdict}."
+    )
+
+    property_identity = {
+        "address":         display_address,
+        "postcode":        rpc,
+        "beds":            beds,
+        "property_type":   prop_type,
+        "floor_area_sqm":  floor_area,
+        "estimated_value": est_value,
+        "asking_price":    asking_price,
+        "calc_price_used": calc_price,
+        "value_sources":   value_sources,
+    }
+
+    data_quality_summary = (
+        f"{conf_label} confidence. "
+        + enh_conf.get("data_age", {}).get("summary", "Data age unknown.")
+    )
+
+    verdict_summary = inv_verd.get("one_sentence_summary", verdict)
+
+    financial_summary = {
+        "purchase_price":       calc_price,
+        "monthly_rent":         rent,
+        "gross_yield_pct":      g_yield,
+        "net_yield_pct":        net_yield,
+        "monthly_cashflow":     cashflow,
+        "annual_profit":        annual_p,
+        "deposit_required":     deposit,
+        "monthly_mortgage":     mortgage,
+        "stamp_duty":           stamp,
+        "five_year_projection": val_5yr,
+        "annual_growth_pct":    growth_r,
+    }
+
+    risks: list = list(inv_verd.get("key_risks", []))
+
+    opportunities: list[str] = []
+    if g_yield >= 6:
+        opportunities.append(f"Above-average gross yield of {g_yield:.1f}%")
+    if cashflow > 0:
+        opportunities.append(f"Positive monthly cashflow of £{cashflow:,}")
+    if inv_sc >= 65:
+        opportunities.append(f"Strong investment score ({inv_sc}/100)")
+    best_reno_roi = (reno_intel.get("best_scenario") or {}).get("roi_pct", 0) if reno_intel else 0
+    if best_reno_roi and float(best_reno_roi) > 20:
+        opportunities.append(f"Renovation ROI potential: {float(best_reno_roi):.0f}%")
+    if growth_r >= 5:
+        opportunities.append(f"Above-average capital growth forecast ({growth_r:.1f}%/yr)")
+    if not opportunities:
+        opportunities.append("Negotiate on price to improve yield above investment threshold")
+
+    if verdict == "BUY":
+        recommended_next_steps = [
+            f"Submit offer at £{inv_dec.get('recommended_offer_price', calc_price):,} ({inv_dec.get('offer_discount_pct', 0):.0f}% below estimate)",
+            "Commission a RICS Level 2 or Level 3 survey before exchange",
+            "Obtain 3 lettings agent rental valuations to verify rent estimate",
+            "Instruct a solicitor and begin conveyancing",
+            "Confirm mortgage terms with a broker at the assumed rate",
+        ]
+    elif verdict == "CONDITIONAL":
+        recommended_next_steps = [
+            f"Negotiate to £{inv_dec.get('max_price_for_6pct_yield', calc_price):,} to achieve 6% gross yield",
+            "Commission a RICS Level 2 survey",
+            "Verify rental value with local letting agents",
+            "Reassess once price and rent assumptions are independently confirmed",
+        ]
+    else:
+        recommended_next_steps = [
+            "Do not proceed at current pricing",
+            f"Walk-away price: £{inv_dec.get('walk_away_price', 0):,} — recalculate if price drops to this level",
+            "Consider alternative properties in this postcode district",
+        ]
+
+    disclaimer = (
+        "This report is generated by Atlas Property Intelligence for informational purposes only. "
+        "It does not constitute financial, legal, or investment advice. All figures are estimates "
+        "based on publicly available data and statistical models. Always seek independent "
+        "professional advice before making any investment decision."
+    )
+
+    return {
+        "executive_summary":      executive_summary,
+        "property_identity":      property_identity,
+        "data_quality_summary":   data_quality_summary,
+        "verdict_summary":        verdict_summary,
+        "financial_summary":      financial_summary,
+        "risks":                  risks,
+        "opportunities":          opportunities,
+        "recommended_next_steps": recommended_next_steps,
+        "disclaimer":             disclaimer,
     }
 
 
